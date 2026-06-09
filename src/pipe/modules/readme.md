@@ -60,6 +60,7 @@ also see the [list of presets shipped with vkdt](../../../doc/howto/presets/pres
 * [filmcurv: display transform curve](./filmcurv/readme.md)
 * [filmsim: spectral analog film simulation](./filmsim/readme.md)
 * [OpenDRT: sophisticated display transform with some colour correction options](./OpenDRT/readme.md)
+* [reinhard: reinhard histogram compression for hdr data](./reinhard/readme.md)
 
 **colour processing/encoding**
 
@@ -89,7 +90,6 @@ also see the [list of presets shipped with vkdt](../../../doc/howto/presets/pres
 * [exposure: simple exposure correction, useful for dodging/burning](./exposure/readme.md)
 * [grad: linear gradient density filter](./grad/readme.md)
 * [llap: local contrast, shadow lifting, and highligh compression via local laplacian pyramids](./llap/readme.md)
-* [vignette: add/remove parametric vignette](./vignette/readme.md)
 * [zones: zone system-like tone manipulation tool](./zones/readme.md)
 
 **retouching**
@@ -100,10 +100,12 @@ also see the [list of presets shipped with vkdt](../../../doc/howto/presets/pres
 * [mask: create parametric masks from colour images for use with blending](./mask/readme.md)
 * [wavelet: skin retouching](./wavelet/readme.md)
 
-**effects**
+**effects/decoration**
 
 * [frame: postcard-style decor border around the image](./frame/readme.md)
 * [grain: simulate analog film grain](./grain/readme.md)
+* [overlay: render transparent text](./overlay/readme.md)
+* [vignette: add/remove parametric vignette](./vignette/readme.md)
 
 **technical**
 
@@ -111,10 +113,10 @@ also see the [list of presets shipped with vkdt](../../../doc/howto/presets/pres
 * [blend: masked frame blending](./blend/readme.md)
 * [cnngenin: generate random input for neural network training](./cnngenin/readme.md)
 * [format: change texture format (number of channels and data type)](./format/readme.md)
+* [hdrmerge: merge images to form hdr radiance map](./hdrmerge/readme.md)
 * [kpn-t: kernel prediction neural network for denoising, training](./kpn-t/readme.md)
 * [mv2rot: estimate rotation + translation from motion vectors](./mv2rot/readme.md)
 * [resize: add ability to resize buffers](./resize/readme.md)
-* [resnet: gmic convolutional neural network](./resnet/readme.md)
 
 **3d/rendering**
 

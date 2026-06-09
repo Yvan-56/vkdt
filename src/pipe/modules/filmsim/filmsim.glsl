@@ -6,20 +6,26 @@
 // number of spectral samples/wavelengths when integrating
 #define SN 40
 
+const vec4 lambda_arr[11] = vec4[](
+  vec4(380.0, 390.0, 400.0, 410.0),
+  vec4(420.0, 430.0, 440.0, 450.0),
+  vec4(460.0, 470.0, 480.0, 490.0),
+  vec4(500.0, 510.0, 520.0, 530.0),
+  vec4(540.0, 550.0, 560.0, 570.0),
+  vec4(580.0, 590.0, 600.0, 610.0),
+  vec4(620.0, 630.0, 640.0, 650.0),
+  vec4(660.0, 670.0, 680.0, 690.0),
+  vec4(700.0, 710.0, 720.0, 730.0),
+  vec4(740.0, 750.0, 760.0, 770.0),
+  vec4(780.0, 790.0, 800.0, 810.0)
+);
+
 vec3 get_sensitivity(vec2 tc)
 {
   vec3 log_sensitivity = texture(img_filmsim, tc).rgb;
   // vec3 log_sensitivity = sample_catmull_rom_1d(img_filmsim, tc).rgb;
-  vec3 sensitivity = pow(vec3(10.0), log_sensitivity);
+  vec3 sensitivity = exp2(log_sensitivity * 3.32192809489);
   return mix(sensitivity, vec3(0.0), isnan(sensitivity));
-}
-
-int binom(inout uint seed, int n, float p)
-{ // gaussian approximation, good for large n*p
-  float u = n*p;
-  float s = sqrt(n*p*(1.0-p));
-  vec2 r = vec2(mrand(seed), mrand(seed));
-  return max(0, int(u + s * warp_gaussian(r).x));
 }
 
 float envelope(float w)
@@ -44,85 +50,126 @@ vec3 thorlabs_filters(float w)
   return vec3(cyan, magenta, yellow);
 }
 
-vec2 hash(in ivec2 p)  // this hash is not production ready, please
-{                        // replace this by something better
-  ivec2 n = p.x*ivec2(3,37) + p.y*ivec2(311,113); // 2D -> 1D
-  // 1D hash by Hugo Elias
-  n = (n << 13) ^ n;
-  n = n * (n * n * 15731 + 789221) + 1376312589;
-  return -1.0+2.0*vec2( n & ivec2(0x0fffffff))/float(0x0fffffff);
-}
-
-float noise(in vec2 p)
+vec3 hash32(vec2 p)
 {
-  float c = 0.98006, s = 0.198669;
-  mat2 R = mat2(c,s,-s,c);
-  ivec2 i = ivec2(floor(R*p));
-  vec2 f = fract(R*p);
-
-  // quintic interpolation
-  vec2 u = f*f*f*(f*(f*6.0-15.0)+10.0);
-  vec2 du = 30.0*f*f*(f*(f-2.0)+1.0);
-
-  vec2 ga = hash(i + ivec2(0,0));
-  vec2 gb = hash(i + ivec2(1,0));
-  vec2 gc = hash(i + ivec2(0,1));
-  vec2 gd = hash(i + ivec2(1,1));
-
-  float va = dot(ga, f - vec2(0.0,0.0));
-  float vb = dot(gb, f - vec2(1.0,0.0));
-  float vc = dot(gc, f - vec2(0.0,1.0));
-  float vd = dot(gd, f - vec2(1.0,1.0));
-
-  return va + u.x*(vb-va) + u.y*(vc-va) + u.x*u.y*(va-vb-vc+vd);   // value
+  vec3 p3 = fract(vec3(p.xyx) * vec3(.1031, .1030, .0973));
+  p3 += dot(p3, p3.yxz + 33.33);
+  return fract((p3.xxy + p3.yzz) * p3.zyx);
 }
 
-float noisef(in vec2 p)
-{
-  return noise(p) + .57*noise(0.61*p);
-}
-
-// separate density into three layers of grains (coarse, mid, fine) that sum up
-// to the max density. lower density values are taken mostly by coarse grains.
-// use perlin gradient noise / correlated to simulate the three layers (represents non-uniformity of grain counts/pixel)
-// simulate a poisson distribution x3: are the grains turned?
-// expectation should be =density, i.e. n*p + n*p + n*p = density for the three layers
 vec3 add_grain(ivec2 ipos, vec3 density, float scale)
 {
-  ipos = ivec2(vec2(ipos)*scale); // if not processing full size (scale = 1), adjust here
-  int n_grains_per_pixel = 50; //1000; // from artic's python. starts to look very good!
-  int grain_non_uniformity = int((1.0-params.grain_uniformity)*n_grains_per_pixel);
-  float grain_size = params.grain_size;
-  float density_max = 3.3;
-  vec3 res = vec3(0.0);
-  uint seed = 123456789*ipos.x + 1333337*ipos.y + (global.frame+global.hash)*100000;
-  vec3 particle_scale_col = vec3(0.8, 1.0, 2.0);
-  vec3 particle_scale_lay = vec3(2.5, 1.0, 0.5);
-  for(int col=0;col<3;col++)
-  {
-    float np = density[col] / density_max; // expectation of normalised number of developed grains
-    float sat = clamp(1.5*np, 0, 1);
-    vec3 doff = vec3(0.10, 0.20, 0.7);
-    for(int layer=0;layer<3;layer++)
-    { // from coarse to fine layers
-      float npl = min(doff[layer], np);
-      np -= npl;
-      float c = 1.0/(particle_scale_col[col] * particle_scale_lay[layer]);
-      vec2 tc = c/grain_size * 0.3*vec2(ipos + global.hash*0.000001 + global.frame*133.7 + 1000*col);
-      int n = int(n_grains_per_pixel*c*scale*scale);
-      // float sat = clamp(npl / doff[layer], 0, 1);
-      // int r = int(grain_non_uniformity*c*noise(tc)*1*sat);
-      int r = int(grain_non_uniformity*c*noisef(tc)*4*max(0,sat-0.0)*max(0,1.0-sat));
-      // int nr = binom(seed, int(n/sat), sat);
-      int nr = max(0, n+r);
-      float p = npl;
-      // if(layer!=2) res[col] += density_max * npl; else
-      res[col] += density_max * nr*p/float(n); // this is using the expected value of developed grains directly
-      // now simulate whether these grains actually turn:
-      // res[col] += density_max * binom(seed, nr, p)/float(n);
+  const float density_max = 3.3;
+  vec3 np = clamp(density / density_max, 0.0, 1.0);
+
+  // Sublayer probability of development (density fractions: Fast 10%, Mid 20%, Slow 70%)
+  vec3 p_dev_0 = clamp(np * 10.0, 0.0, 1.0);
+  vec3 p_dev_1 = clamp(np * 5.0 - 0.5, 0.0, 1.0);
+  vec3 p_dev_2 = clamp(np * 1.42857 - 0.42857, 0.0, 1.0);
+
+  // Uniformity mapped to spektrafilm defaults (0.97, 0.97, 0.99)
+  float u_scalar = pow(max(0.0, params.grain_uniformity), 0.333333);
+  vec3 u = clamp(vec3(0.97, 0.97, 0.99) * u_scalar, 0.0, 1.0);
+  
+  // spektrafilm agx_particle_scale = (0.8, 1.0, 2.0)
+  vec3 ch_scale = vec3(0.8, 1.0, 2.0);
+
+  // Exact spektrafilm layer variances: Var = p * (1 - p * u)
+  vec3 var_0 = p_dev_0 * max(1.0 - p_dev_0 * u, 0.0);
+  vec3 var_1 = p_dev_1 * max(1.0 - p_dev_1 * u, 0.0);
+  vec3 var_2 = p_dev_2 * max(1.0 - p_dev_2 * u, 0.0);
+
+  // Optical Density of a single particle
+  // od_particle = density_max_total * agx_particle_area_um2 * ch_scale * sl_scale / pixel_area_um2
+  // 3.3 * 0.2 * ch_scale * sl_scale / 100.0 = 0.0066 * ch_scale * sl_scale
+  vec3 od_0 = 0.0066 * ch_scale * 2.5;
+  vec3 od_1 = 0.0066 * ch_scale * 1.0;
+  vec3 od_2 = 0.0066 * ch_scale * 0.5;
+
+  // The true standard deviation in density space is sqrt(od_particle * density_max_fraction * Var)
+  // Spektrafilm fractions: Fast=0.1, Mid=0.2, Slow=0.7
+  // density_max_fraction = 3.3 * fraction
+  vec3 std_0 = sqrt(od_0 * (3.3 * 0.1) * var_0);
+  vec3 std_1 = sqrt(od_1 * (3.3 * 0.2) * var_1);
+  vec3 std_2 = sqrt(od_2 * (3.3 * 0.7) * var_2);
+
+  // Blur Sigma calculations
+  // spektrafilm per-layer dye cloud blur: sigma_layer = blur_dye_clouds_um * sqrt(od_particle)
+  // blur_dye_clouds_um defaults to 1.0
+  vec3 sigma_sq_layer_0 = 1.0 * 1.0 * od_0;
+  vec3 sigma_sq_layer_1 = 1.0 * 1.0 * od_1;
+  vec3 sigma_sq_layer_2 = 1.0 * 1.0 * od_2;
+
+  // Global blur (defaults to 0.65)
+  float global_blur_sq = 0.65 * 0.65;
+
+  // Total variance of the combined Gaussian blurs: sigma_total^2 = sigma_layer^2 + sigma_global^2
+  vec3 sigma_sq_0 = sigma_sq_layer_0 + global_blur_sq;
+  vec3 sigma_sq_1 = sigma_sq_layer_1 + global_blur_sq;
+  vec3 sigma_sq_2 = sigma_sq_layer_2 + global_blur_sq;
+
+  // Inverse variance for spatial Gaussian weights: 1 / (2 * sigma^2)
+  // Multiply by grain_size^2 to allow UI scaling of the blur radius
+  float g_scale_sq = params.grain_size * params.grain_size;
+  // We use coordinate scaling to allow large grain sizes with a constant 4x4 loop.
+  // The noise coordinates are scaled by 1/grain_size, effectively making the "particles" larger.
+  // We cap the scaling at 1.0 to preserve the original 1:1 pixel grain behavior for small sizes.
+  float coord_scale = max(1.0, params.grain_size);
+  float inv_coord_scale = 1.0 / coord_scale;
+
+  vec3 inv_2sq_0 = 1.0 / (2.0 * sigma_sq_0 * g_scale_sq * inv_coord_scale * inv_coord_scale);
+  vec3 inv_2sq_1 = 1.0 / (2.0 * sigma_sq_1 * g_scale_sq * inv_coord_scale * inv_coord_scale);
+  vec3 inv_2sq_2 = 1.0 / (2.0 * sigma_sq_2 * g_scale_sq * inv_coord_scale * inv_coord_scale);
+
+  vec2 seed_offset = vec2(global.hash*1e-6 + fract(float(global.frame)*0.1337)*1000.0);
+  // Scale the noise coordinates. 'scale' is for resolution/downsampling.
+  vec2 pos = mat2(0.98006, -0.198669, 0.198669, 0.98006) * (vec2(ipos) * scale * inv_coord_scale + seed_offset);
+  
+  vec2 p = floor(pos);
+  vec2 f = fract(pos);
+
+  vec3 acc0 = vec3(0.0), acc1 = vec3(0.0), acc2 = vec3(0.0);
+  vec3 wsq0 = vec3(0.0), wsq1 = vec3(0.0), wsq2 = vec3(0.0);
+
+  vec3 inv_2sq_0_l2e = inv_2sq_0 * 1.44269504;
+  vec3 inv_2sq_1_l2e = inv_2sq_1 * 1.44269504;
+  vec3 inv_2sq_2_l2e = inv_2sq_2 * 1.44269504;
+
+  [[loop]]
+  for (int y = -1; y <= 2; y++) {
+    float dy = float(y) - f.y;
+    float dy2 = dy * dy;
+    [[loop]]
+    for (int x = -1; x <= 2; x++) {
+      float dx = float(x) - f.x;
+      float dist_sq = dx * dx + dy2;
+      float window = max(0.0, 1.0 - dist_sq * 0.125);
+      if (window <= 0.0) continue;
+
+      vec2 hash_pos = p + vec2(float(x), float(y));
+      vec3 n0 = hash32(hash_pos) * 2.0 - 1.0;
+      vec3 n1 = hash32(hash_pos + 13.37) * 2.0 - 1.0;
+      vec3 n2 = hash32(hash_pos + 42.0) * 2.0 - 1.0;
+
+      vec3 w0 = exp2(-dist_sq * inv_2sq_0_l2e) * window;
+      vec3 w1 = exp2(-dist_sq * inv_2sq_1_l2e) * window;
+      vec3 w2 = exp2(-dist_sq * inv_2sq_2_l2e) * window;
+
+      acc0 += n0 * w0; acc1 += n1 * w1; acc2 += n2 * w2;
+      wsq0 += w0 * w0; wsq1 += w1 * w1; wsq2 += w2 * w2;
     }
   }
-  return res;
+
+  // Multiply by sqrt(3.0) (~1.732) to map uniform noise [-1, 1] variance to 1.0
+  // Then divide by sqrt(sum(w^2)) to mathematically preserve standard deviation through the blur
+  vec3 blur_n0 = acc0 * 1.73205 * inversesqrt(max(wsq0, 1e-6));
+  vec3 blur_n1 = acc1 * 1.73205 * inversesqrt(max(wsq1, 1e-6));
+  vec3 blur_n2 = acc2 * 1.73205 * inversesqrt(max(wsq2, 1e-6));
+
+  // Combine layers (each noise field is standard normal N(0,1), so they scale exactly by std_X)
+  vec3 final_noise = blur_n0 * std_0 + blur_n1 * std_1 + blur_n2 * std_2;
+
+  return clamp(density + final_noise, vec3(0.0), vec3(2.0));
 }
 
 const int s_sensitivity = 0;
@@ -135,75 +182,312 @@ float get_tcy(int type, int stock)
   return (stock * 3 + off + 0.5)/s;
 }
 
+// --- Shared Memory Buffers for caching spectral integration inputs ---
+// Optimized for vectorized spectral loops (4 wavelengths at once)
+shared vec4 shared_expose_factor_r[11];
+shared vec4 shared_expose_factor_g[11];
+shared vec4 shared_expose_factor_b[11];
+
+shared vec4 shared_enlarger_dye_r[11];
+shared vec4 shared_enlarger_dye_g[11];
+shared vec4 shared_enlarger_dye_b[11];
+shared vec4 shared_enlarger_factor_r[11];
+shared vec4 shared_enlarger_factor_g[11];
+shared vec4 shared_enlarger_factor_b[11];
+
+shared vec4 shared_scan_dye_r[11];
+shared vec4 shared_scan_dye_g[11];
+shared vec4 shared_scan_dye_b[11];
+shared vec4 shared_scan_factor_r[11];
+shared vec4 shared_scan_factor_g[11];
+shared vec4 shared_scan_factor_b[11];
+
+shared mat3 shared_M;
+shared vec3 shared_M_sum;
+shared vec3 shared_preflash;
+shared vec3 shared_pf_acc[64];
+
+void init_expose_film_shared(int film)
+{
+  int tid = int(gl_LocalInvocationIndex);
+  if (tid < 11)
+  {
+    shared_expose_factor_r[tid] = vec4(0.0);
+    shared_expose_factor_g[tid] = vec4(0.0);
+    shared_expose_factor_b[tid] = vec4(0.0);
+  }
+  barrier();
+  if (tid <= 35)
+  {
+    float lambda = 380.0 + tid * 10.0;
+    // TODO this shall include skin spectra! * scene illuminant, D65 say
+    vec2 tc = vec2((tid * 2.0 + 0.5) / 256.0, get_tcy(s_sensitivity, film));
+    vec3 sensitivity = get_sensitivity(tc);
+    // avoid some metameric madness film vs cie cmf: cut off wavelength ranges
+    // that the spectral upsampling doesn't care about (outside the XYZ support)
+    float env = envelope(lambda);
+    float pdf = 2.0 * 41.0; // our integration is off by -1ev from agx, so 2.0 here
+    vec3 factor = sensitivity * env / pdf;
+    shared_expose_factor_r[tid/4][tid%4] = factor.r;
+    shared_expose_factor_g[tid/4][tid%4] = factor.g;
+    shared_expose_factor_b[tid/4][tid%4] = factor.b;
+  }
+  barrier();
+}
+
+void init_enlarger_shared(int film, int paper)
+{
+  int tid = int(gl_LocalInvocationIndex);
+  if (tid < 11)
+  {
+    shared_enlarger_dye_r[tid] = vec4(0.0);
+    shared_enlarger_dye_g[tid] = vec4(0.0);
+    shared_enlarger_dye_b[tid] = vec4(0.0);
+    shared_enlarger_factor_r[tid] = vec4(0.0);
+    shared_enlarger_factor_g[tid] = vec4(0.0);
+    shared_enlarger_factor_b[tid] = vec4(0.0);
+  }
+  barrier();
+  if (tid <= 40)
+  {
+    float lambda = 380.0 + tid * 10.0;
+    vec2 tc = vec2((tid * 2.0 + 0.5) / 256.0, get_tcy(s_sensitivity, paper));
+    vec3 sensitivity = get_sensitivity(tc);
+    
+    tc.y = get_tcy(s_dye_density, film);
+    vec4 dye_density = texture(img_filmsim, tc);
+    dye_density = mix(dye_density, vec4(1000000.0), isnan(dye_density));
+    dye_density.xyz *= 3.32192809489;
+
+    vec3 neutral = vec3(params.filter_c,
+        clamp(params.filter_m, 0, 1) + 0.1*params.tune_m,
+        clamp(params.filter_y, 0, 1) + 0.1*params.tune_y);
+    neutral = clamp(neutral, vec3(0.0), vec3(1.0));
+    
+    float illuminant = (0.002 * 1.0) * colour_blackbody(vec4(lambda), 2856.0).x;
+    float base_density = dye_density.w * dye_density_min_factor_film;
+    float base_light = exp2(-base_density * 3.32192809489);
+    float common_light = illuminant * base_light * exp2(params.ev_paper) * 1000000.0;
+
+    // pretty coarse manual fit to thorlabs filters:
+    // (lamp filters are transmittances 0..100%)
+    vec3 enlarger = mix(vec3(1.0), thorlabs_filters(lambda), neutral);
+    float print_illuminant = enlarger.x * enlarger.y * enlarger.z * common_light;
+    vec3 factor = sensitivity * print_illuminant;
+
+    vec3 pf_factor = vec3(0.0);
+    if (params.preflash > 0)
+    {
+      vec3 pf_neutral = vec3(params.filter_c,
+          clamp(params.filter_m, 0, 1) + 0.1*params.tune_m + params.pf_m,
+          clamp(params.filter_y, 0, 1) + 0.1*params.tune_y + params.pf_y);
+      pf_neutral = clamp(pf_neutral, vec3(0.0), vec3(1.0));
+      vec3 pf_enlarger = mix(vec3(1.0), thorlabs_filters(lambda), pf_neutral);
+      float pf_print_illuminant = pf_enlarger.x * pf_enlarger.y * pf_enlarger.z * common_light * exp2(params.pf_ev);
+      pf_factor = sensitivity * pf_print_illuminant;
+    }
+    shared_pf_acc[tid] = pf_factor;
+
+    shared_enlarger_dye_r[tid/4][tid%4] = dye_density.x;
+    shared_enlarger_dye_g[tid/4][tid%4] = dye_density.y;
+    shared_enlarger_dye_b[tid/4][tid%4] = dye_density.z;
+    shared_enlarger_factor_r[tid/4][tid%4] = factor.r;
+    shared_enlarger_factor_g[tid/4][tid%4] = factor.g;
+    shared_enlarger_factor_b[tid/4][tid%4] = factor.b;
+  }
+  else if (tid < 64) shared_pf_acc[tid] = vec3(0.0);
+  barrier();
+  // reduction for preflash
+  if (tid < 32) shared_pf_acc[tid] += shared_pf_acc[tid + 32];
+  barrier();
+  if (tid < 16) shared_pf_acc[tid] += shared_pf_acc[tid + 16];
+  barrier();
+  if (tid < 8)  shared_pf_acc[tid] += shared_pf_acc[tid + 8];
+  barrier();
+  if (tid < 4)  shared_pf_acc[tid] += shared_pf_acc[tid + 4];
+  barrier();
+  if (tid < 2)  shared_pf_acc[tid] += shared_pf_acc[tid + 2];
+  barrier();
+  if (tid < 1)  shared_preflash = (shared_pf_acc[0] + shared_pf_acc[1]);
+  barrier();
+}
+
+void init_enlarger_negative_shared(int paper)
+{
+  int tid = int(gl_LocalInvocationIndex);
+  if (tid < 11)
+  {
+    shared_enlarger_factor_r[tid] = vec4(0.0);
+    shared_enlarger_factor_g[tid] = vec4(0.0);
+    shared_enlarger_factor_b[tid] = vec4(0.0);
+  }
+  barrier();
+  if (tid <= 40)
+  {
+    float lambda = 380.0 + tid * 10.0;
+    // TODO should this use reflectances and then multiply the illuminant?
+    // XXX does it contain D65??
+    vec2 tc = vec2((tid * 2.0 + 0.5) / 256.0, get_tcy(s_sensitivity, paper));
+    vec3 sensitivity = get_sensitivity(tc);
+
+    vec3 neutral = vec3(params.filter_c,
+        clamp(params.filter_m, 0, 1) + 0.1*params.tune_m,
+        clamp(params.filter_y, 0, 1) + 0.1*params.tune_y);
+    neutral = clamp(neutral, vec3(0.0), vec3(1.0));
+    
+    float illuminant = (0.002 * 1.0) * 1000000.0 * colour_blackbody(vec4(lambda), 2856.0).x;
+    float common_light = illuminant * exp2(params.ev_paper);
+
+    // pretty coarse manual fit to thorlabs filters:
+    // (lamp filters are transmittances 0..100%)
+    vec3 enlarger = mix(vec3(1.0), thorlabs_filters(lambda), neutral);
+    float print_illuminant = enlarger.x * enlarger.y * enlarger.z * common_light;
+    vec3 factor = sensitivity * print_illuminant;
+
+    vec3 pf_factor = vec3(0.0);
+    if (params.preflash > 0)
+    {
+      vec3 pf_neutral = vec3(params.filter_c,
+          clamp(params.filter_m, 0, 1) + 0.1*params.tune_m + params.pf_m,
+          clamp(params.filter_y, 0, 1) + 0.1*params.tune_y + params.pf_y);
+      pf_neutral = clamp(pf_neutral, vec3(0.0), vec3(1.0));
+      vec3 pf_enlarger = mix(vec3(1.0), thorlabs_filters(lambda), pf_neutral);
+      float pf_print_illuminant = pf_enlarger.x * pf_enlarger.y * pf_enlarger.z * common_light * exp2(params.pf_ev);
+      pf_factor = sensitivity * pf_print_illuminant;
+    }
+    shared_pf_acc[tid] = pf_factor;
+
+    shared_enlarger_factor_r[tid/4][tid%4] = factor.r;
+    shared_enlarger_factor_g[tid/4][tid%4] = factor.g;
+    shared_enlarger_factor_b[tid/4][tid%4] = factor.b;
+  }
+  else if (tid < 64) shared_pf_acc[tid] = vec3(0.0);
+  barrier();
+  // reduction for preflash
+  if (tid < 32) shared_pf_acc[tid] += shared_pf_acc[tid + 32];
+  barrier();
+  if (tid < 16) shared_pf_acc[tid] += shared_pf_acc[tid + 16];
+  barrier();
+  if (tid < 8)  shared_pf_acc[tid] += shared_pf_acc[tid + 8];
+  barrier();
+  if (tid < 4)  shared_pf_acc[tid] += shared_pf_acc[tid + 4];
+  barrier();
+  if (tid < 2)  shared_pf_acc[tid] += shared_pf_acc[tid + 2];
+  barrier();
+  if (tid < 1)  shared_preflash = (shared_pf_acc[0] + shared_pf_acc[1]);
+  barrier();
+}
+
+void init_scan_shared()
+{
+  int tid = int(gl_LocalInvocationIndex);
+  if (tid < 11)
+  {
+    shared_scan_dye_r[tid] = vec4(0.0);
+    shared_scan_dye_g[tid] = vec4(0.0);
+    shared_scan_dye_b[tid] = vec4(0.0);
+    shared_scan_factor_r[tid] = vec4(0.0);
+    shared_scan_factor_g[tid] = vec4(0.0);
+    shared_scan_factor_b[tid] = vec4(0.0);
+  }
+  barrier();
+  if (tid <= 40)
+  {
+    float lambda = 380.0 + tid * 10.0;
+    const int paper = s_paper_offset + params.paper;
+    const int film  = params.film;
+    int dye_stock = (params.process != 1) ? paper : film;
+    
+    vec2 tc = vec2((tid * 2.0 + 0.5) / 256.0, get_tcy(s_dye_density, dye_stock));
+    vec4 dye_density = texture(img_filmsim, tc);
+    dye_density = mix(dye_density, vec4(1000.0), isnan(dye_density));
+    dye_density.xyz *= 3.32192809489;
+
+    vec3 d50 = vec3(0.9642, 1.0000, 0.8251);
+    vec4 coeff = fetch_coeff(d50);
+    float scan_illuminant = (4.0 / 41.0) * sigmoid_eval(coeff, lambda);
+    vec3 cmf = cmf_1931(lambda);
+    
+    float factor = (params.process != 1) ? dye_density_min_factor_paper : dye_density_min_factor_film;
+    float base_density = dye_density.w * factor;
+    float base_light = exp2(-base_density * 3.32192809489);
+    vec3 factor_vec = scan_illuminant * cmf * base_light;
+
+    shared_scan_dye_r[tid/4][tid%4] = dye_density.x;
+    shared_scan_dye_g[tid/4][tid%4] = dye_density.y;
+    shared_scan_dye_b[tid/4][tid%4] = dye_density.z;
+    shared_scan_factor_r[tid/4][tid%4] = factor_vec.r;
+    shared_scan_factor_g[tid/4][tid%4] = factor_vec.g;
+    shared_scan_factor_b[tid/4][tid%4] = factor_vec.b;
+  }
+  barrier();
+}
+
+void init_coupler_matrix_shared()
+{
+  int tid = int(gl_LocalInvocationIndex);
+  if (tid == 0)
+  {
+    mat3 M = mat3(6.0, 4.0, 1.0, 4.0, 6.0, 4.0, 1.0, 4.0, 6.0);
+    vec3 amount = vec3(0.1, 0.2, 0.5)*3.0;
+    M[0] *= 1.0/11.0 * amount.r * params.couplers;
+    M[1] *= 1.0/14.0 * amount.g * params.couplers;
+    M[2] *= 1.0/11.0 * amount.b * params.couplers;
+    shared_M = M;
+    shared_M_sum = M * vec3(1.0);
+  }
+  barrier();
+}
+
 vec3 // returns log_raw
 expose_film(vec3 rgb, int film)
-{ // film exposure in camera and chemical development
-  vec4 d65cf = fetch_coeff(vec3(1));
+{ // film exposure in camera and chemical development (Vectorized spectral loop)
+  rgb = max(vec3(5e-4), rgb); // clamp dark noise to avoid nan in the process
+  // vec4 d65cf = fetch_coeff(vec3(1));
+  // this upsamples *reflectances*, i.e. 111 is equal energy not D65
   vec4 coeff = fetch_coeff(rgb);
-  // const mat3 M = mat3(
-  //      1.66022677, -0.12455334, -0.01815514,
-  //     -0.58754761,  1.13292605, -0.10060303,
-  //     -0.07283825, -0.00834963,  1.11899817);
-  // vec3 srgb = M * rgb;
-  vec2 tc = vec2(0, get_tcy(s_sensitivity, film));
   vec3 raw = vec3(0.0);
-  for(int l=0;l<=SN;l++)
+  [[unroll]]
+  // envelope(w >= 730nm) = 1000.0 * 1.0 * (1.0 - 1.0) = 0.0
+  // lambda_arr[9] = vec4(740, 750, 760, 770)
+  for(int i=0; i<9; i++)
   {
-    float pdf = 2.0*(SN+1.0); // our integration is off by -1ev from agx, so 2.0 here
-    float lambda = 380.0 + l*400.0/SN;
-    tc.x = (l*80.0/SN+0.5)/256.0;
-    float val = sigmoid_eval(coeff, lambda);
-    // this upsamples *reflectances*, i.e. 111 is equal energy not D65
-    // float val = colour_upsample(srgb, vec4(lambda)).x * sigmoid_eval(d65cf, lambda);
-    // not sure if needed: cuts off wavelength ranges that the spectral
-    // upsampling doesn't care about since it is outside the XYZ support
-    float env = envelope(lambda);
-    vec3 sensitivity = get_sensitivity(tc);
-    raw += sensitivity * val * env / pdf;
+    vec4 lambda = lambda_arr[i];
+    // x = (coeff.x * lambda + coeff.y) * lambda + coeff.z
+    vec4 x = (coeff.x * lambda + coeff.y) * lambda + coeff.z;
+    vec4 y = inversesqrt(x * x + 1.0);
+    vec4 val = (0.5 * x * y + 0.5) * coeff.w;
+    raw.r += dot(val, shared_expose_factor_r[i]);
+    raw.g += dot(val, shared_expose_factor_g[i]);
+    raw.b += dot(val, shared_expose_factor_b[i]);
   }
-  const float one_log10 = 0.43429448190325176, log2_log10 = 0.30102999566398114;
-  return params.ev_film * log2_log10 + log(raw+1e-10) * one_log10;
+  const float log2_log10 = 0.30102999566398114;
+  return params.ev_film * log2_log10 + log2(raw+1e-10) * log2_log10;
 }
 
 vec3 sigmoid(vec3 x)
 {
-  // return 0.5 + 0.5 * x / sqrt(1.0+x*x);
-  const float b = 4.5;
-  return 0.5 + 0.5*x / pow(pow(abs(x), vec3(b)) + 1.0, vec3(1.0/b));
+  vec3 abs_x = abs(x);
+  vec3 x2 = abs_x * abs_x;
+  vec3 x4 = x2 * x2;
+  vec3 xb = x4 * sqrt(abs_x);
+  return 0.5 + 0.5*x * exp2(-0.2222222222222222 * log2(xb + 1.0));
 }
 
-vec3 sigmoid_ddx(vec3 x)
+void sigmoid_both(vec3 x, out vec3 sig, out vec3 sig_d)
 {
-  // return 0.5*pow(x*x+1.0, vec3(-3.0/2.0));
-  const float b = 4.5;
-  vec3 xb = pow(abs(x), vec3(b));
-  return 1.0/(pow(xb + 1.0, vec3(1.0/b)) * (xb + 1.0) * 2.0);
+  // Combined evaluation of sigmoid and its derivative.
+  // We reuse abs_x, x2, x4, and xb calculations.
+  vec3 abs_x = abs(x);
+  vec3 x2 = abs_x * abs_x;
+  vec3 x4 = x2 * x2;
+  vec3 xb = x4 * sqrt(abs_x);
+  vec3 base = xb + 1.0;
+  vec3 rcp_p1 = exp2(-0.2222222222222222 * log2(base));
+  sig = 0.5 + 0.5 * x * rcp_p1;
+  sig_d = 0.5 * rcp_p1 / base;
 }
 
-vec3 solve_f(vec3 e, vec3 ep, mat3 M)
-{
-  return e - ep - M * sigmoid(e);
-}
-
-vec3 solve_fp(vec3 e, vec3 ep, mat3 M)
-{
-  return vec3(1.0) - M * sigmoid_ddx(e);
-}
-
-vec3 newton_step(vec3 e, vec3 ep, mat3 M)
-{
-  return e - solve_f(e, ep, M)/solve_fp(e, ep, M);
-}
-
-mat3 coupler_matrix()
-{
-  mat3 M = mat3(6.0, 4.0, 1.0, 4.0, 6.0, 4.0, 1.0, 4.0, 6.0);
-  vec3 amount = vec3(0.1, 0.2, 0.5)*3;
-  M[0] *= 1.0/11.0 * amount.r * params.couplers;
-  M[1] *= 1.0/14.0 * amount.g * params.couplers;
-  M[2] *= 1.0/11.0 * amount.b * params.couplers;
-  return M;
-}
 
 vec3 // returns density_cmy;
 develop_film_compute_couplers(vec3 log_raw)
@@ -217,45 +501,37 @@ develop_film_compute_couplers(vec3 log_raw)
   // note that this if at all only holds for *neutral* e (i.e. same channels)
   // other than agx-emulsion, this assumes the couplers are created relative to log exp e, not
   // an initial density (in the sense of a fixed point iteration or so)
-  mat3 M = coupler_matrix();
 #if 0
   // the coupler/inhibitor M*log_raw should diffuse spatially, so we
   // write it out here, split the kernel, blur, and come back in part1.comp
-  return M * log_raw;
+  return shared_M * log_raw;
 #else
-  return M * sigmoid(log_raw);
+  return shared_M * sigmoid(log_raw);
 #endif
 }
 
 vec3 // returns new log_raw
 develop_film_correct_exposure(vec3 log_raw, vec3 coupler)
 {
-  log_raw -= coupler;
-  mat3 M = coupler_matrix();
-#if 0
-  mat3 I = mat3(1.0);
-  // then we need to evaluate D_0 at this location
-  log_raw.r = (inverse(I-M)*log_raw.rrr).r;
-  log_raw.g = (inverse(I-M)*log_raw.ggg).g;
-  log_raw.b = (inverse(I-M)*log_raw.bbb).b;
-  // now we went full circle and log_raw = log_raw (except for the colour that is, which is what was wanted)
-  return log_raw;
-#else
-  vec3 result;
-  vec3 log_raw_corr = vec3(0.0);
-  for(int i=0;i<5;i++)
-    log_raw_corr = newton_step(log_raw_corr, log_raw.rrr, M);
-  result.r = log_raw_corr.r;
-  log_raw_corr = vec3(0.0);
-  for(int i=0;i<5;i++)
-    log_raw_corr = newton_step(log_raw_corr, log_raw.ggg, M);
-  result.g = log_raw_corr.g;
-  log_raw_corr = vec3(0.0);
-  for(int i=0;i<5;i++)
-    log_raw_corr = newton_step(log_raw_corr, log_raw.bbb, M);
-  result.b = log_raw_corr.b;
-  return result;
-#endif
+  if (params.couplers <= 0.0) return log_raw;
+
+  vec3 ep = log_raw - coupler;
+  vec3 M_sum = shared_M_sum;
+
+  // Vectorized initial guess for all 3 channels
+  vec3 e = (ep + 0.5 * M_sum) / (1.0 - 0.5 * M_sum);
+
+  vec3 sig, sig_d;
+  [[unroll]]
+  for(int i=0; i<5; i++)
+  {
+    // Evaluates R, G, and B in parallel
+    sigmoid_both(e, sig, sig_d);
+
+    // Vectorized Newton step
+    e -= (e - ep - M_sum * sig) / (1.0 - M_sum * sig_d);
+  }
+  return e;
 }
 
 vec3 // returns density_cmy
@@ -271,103 +547,67 @@ develop_film(vec3 log_raw, int film, ivec2 ipos, float scale)
       texture(img_filmsim, vec2(tcx.b, tc.y)).b);
   density_cmy = mix(density_cmy, vec3(0.0), isnan(density_cmy));
 
-  if(scale < 10.0 && params.grain > 0) density_cmy = add_grain(ipos, density_cmy, scale);
+  [[branch]] if(scale < 10.0 && params.grain > 0) density_cmy = add_grain(ipos, density_cmy, scale);
   return density_cmy;
 }
 
 vec3 // returns log raw
 enlarger_expose_negative_to_paper(vec3 rgb)
-{ // enlarger: expose scanned transmittances of negative to print paper
+{ // enlarger: expose scanned transmittances of negative to print paper (Vectorized spectral loop)
   vec3 raw = vec3(0.0);
-  const int paper = s_paper_offset + params.paper;
-  vec3 neutral = vec3(params.filter_c,
-      clamp(params.filter_m, 0, 1) + 0.1*params.tune_m,
-      clamp(params.filter_y, 0, 1) + 0.1*params.tune_y);
-  neutral = clamp(neutral, vec3(0.0), vec3(1.0));
   vec4 coeff = fetch_coeff(rgb);
-  for(int l=0;l<=SN;l++)
+  [[unroll]]
+  for(int i=0; i<10; i++)
   {
-    float lambda = 380.0 + l*400.0/SN;
-    vec2 tc = vec2(0.0, get_tcy(s_sensitivity, paper));
-    tc.x = (l*(80.0/SN)+0.5)/256.0;
-    vec3 sensitivity = get_sensitivity(tc);
-    float transmittance = sigmoid_eval(coeff, lambda);
-
-    float illuminant = (0.002*40.0/SN)*colour_blackbody(vec4(lambda), 2856.0).x;
-#if 1 // pretty coarse manual fit to thorlabs filters:
-    vec3 enlarger = 100.0*mix(
-      vec3(1.0),
-      thorlabs_filters(lambda),
-      neutral);
-#else
-    // lamp filters are transmittances 0..100%
-    vec3 enlarger = 100.0*mix(
-      vec3(1.0),
-      vec3(sigmoid_eval(coeff_c, lambda), sigmoid_eval(coeff_m, lambda), sigmoid_eval(coeff_y, lambda)),
-      neutral);
-#endif
-    float print_illuminant = enlarger.x*enlarger.y*enlarger.z * illuminant;
-    float light = transmittance * print_illuminant;
-    raw += sensitivity * light * pow(2.0, params.ev_paper);
-    // TODO and the same yet again for the preflash
+    vec4 lambda = lambda_arr[i];
+    vec4 x = (coeff.x * lambda + coeff.y) * lambda + coeff.z;
+    vec4 y = inversesqrt(x * x + 1.0);
+    vec4 transmittance = (0.5 * x * y + 0.5) * coeff.w;
+    raw.r += dot(transmittance, shared_enlarger_factor_r[i]);
+    raw.g += dot(transmittance, shared_enlarger_factor_g[i]);
+    raw.b += dot(transmittance, shared_enlarger_factor_b[i]);
   }
-  const float one_log10 = 0.43429448190325176;
-  return log(raw + 1e-10)*one_log10;
+  { // i=10 (lambda_arr[10] = vec4(780, 790, 800, 810))
+    // tid <= 40 evaluates up to lambda=780nm
+    float lambda = lambda_arr[10].x;
+    float x = (coeff.x * lambda + coeff.y) * lambda + coeff.z;
+    float y = inversesqrt(x * x + 1.0);
+    float transmittance = (0.5 * x * y + 0.5) * coeff.w;
+    raw.r += transmittance * shared_enlarger_factor_r[10].x;
+    raw.g += transmittance * shared_enlarger_factor_g[10].x;
+    raw.b += transmittance * shared_enlarger_factor_b[10].x;
+  }
+  const float log2_log10 = 0.30102999566398114;
+  return log2(raw + shared_preflash + 1e-10)*log2_log10;
 }
 
 vec3 // returns log raw
 enlarger_expose_film_to_paper(vec3 density_cmy)
-{ // enlarger: expose film to print paper
+{ // enlarger: expose film to print paper (Vectorized spectral loop)
   vec3 raw = vec3(0.0);
-  const int film  = params.film;
-  const int paper = s_paper_offset + params.paper;
-  // vec3 tungsten = vec3(1.0985, 1.0000, 0.3558); // 2856K
-  // vec4 coeff_l = fetch_coeff(XYZ_to_rec2020(tungsten));
-  // sigmoidal transmission filters for cmy:
-  // vec4 coeff_c = fetch_coeff(vec3(0.153, 1.0, 0.5));
-  // vec4 coeff_m = fetch_coeff(vec3(1.0, -0.1, 2.0));
-  // vec4 coeff_y = fetch_coeff(vec3(1.0, 0.3, 0.0));
-  // coeff_c.w = coeff_m.w = coeff_y.w = 1.0; // we want reflectance/transmittance limited to 1.0 here
-  vec3 neutral = vec3(params.filter_c,
-      clamp(params.filter_m, 0, 1) + 0.1*params.tune_m,
-      clamp(params.filter_y, 0, 1) + 0.1*params.tune_y);
-  neutral = clamp(neutral, vec3(0.0), vec3(1.0));
-  for(int l=0;l<=SN;l++)
+  [[unroll]]
+  for(int i=0; i<10; i++)
   {
-    float lambda = 380.0 + l*400.0/SN;
-    vec2 tc = vec2(0.0, get_tcy(s_sensitivity, paper));
-    tc.x = (l*(80.0/SN)+0.5)/256.0;
-    vec3 sensitivity = get_sensitivity(tc);
-    tc.y = get_tcy(s_dye_density, film);
-    vec4 dye_density = texture(img_filmsim, tc);
-    dye_density = mix(dye_density, vec4(1000000.0), isnan(dye_density));
-    float density_spectral = dot(density_cmy, dye_density.xyz);
-    density_spectral += dye_density.w * dye_density_min_factor_film;
-
-    // float illuminant = 0.001*colour_blackbody(vec4(lambda), 3200.0).x;
-    // float illuminant = 0.03*colour_blackbody(vec4(lambda), 2200.0).x;
-    float illuminant = (0.002*40.0/SN)*colour_blackbody(vec4(lambda), 2856.0).x;
-    // float illuminant = 5*sigmoid_eval(coeff_l, lambda);
-#if 1 // pretty coarse manual fit to thorlabs filters:
-    vec3 enlarger = 100.0*mix(
-      // vec3 enlarger = mix(
-      vec3(1.0),
-      thorlabs_filters(lambda),
-      neutral);
-#else
-    // lamp filters are transmittances 0..100%
-    vec3 enlarger = 100.0*mix(
-      vec3(1.0),
-      vec3(sigmoid_eval(coeff_c, lambda), sigmoid_eval(coeff_m, lambda), sigmoid_eval(coeff_y, lambda)),
-      neutral);
-#endif
-    float print_illuminant = enlarger.x*enlarger.y*enlarger.z * illuminant;
-    float light = pow(10.0, -density_spectral) * print_illuminant;
-    raw += sensitivity * light * pow(2.0, params.ev_paper);
-    // TODO and the same yet again for the preflash
+    vec4 ds = density_cmy.x * shared_enlarger_dye_r[i] + 
+              density_cmy.y * shared_enlarger_dye_g[i] + 
+              density_cmy.z * shared_enlarger_dye_b[i];
+    vec4 light = exp2(-ds);
+    raw.r += dot(light, shared_enlarger_factor_r[i]);
+    raw.g += dot(light, shared_enlarger_factor_g[i]);
+    raw.b += dot(light, shared_enlarger_factor_b[i]);
   }
-  const float one_log10 = 0.43429448190325176;
-  return log(raw + 1e-10)*one_log10;
+  { // i=10 (lambda_arr[10] = vec4(780, 790, 800, 810))
+    // tid <= 40 evaluates up to lambda=780nm
+    float ds = density_cmy.x * shared_enlarger_dye_r[10].x + 
+               density_cmy.y * shared_enlarger_dye_g[10].x + 
+               density_cmy.z * shared_enlarger_dye_b[10].x;
+    float light = exp2(-ds);
+    raw.r += light * shared_enlarger_factor_r[10].x;
+    raw.g += light * shared_enlarger_factor_g[10].x;
+    raw.b += light * shared_enlarger_factor_b[10].x;
+  }
+  const float log2_log10 = 0.30102999566398114;
+  return log2(raw + shared_preflash + 1e-10)*log2_log10;
 }
 
 vec3 // return density_cmy
@@ -386,26 +626,28 @@ develop_print(vec3 log_raw)
 
 vec3 // return rgb linear rec2020
 scan(vec3 density_cmy)
-{ // convert cmy density to spectral
-  // absorption / dye density of developed film
+{ // convert cmy density to spectral (Vectorized spectral loop)
   vec3 raw = vec3(0.0);
-  vec3 d50 = vec3(0.9642, 1.0000, 0.8251); // 5002K
-  vec4 coeff = fetch_coeff(d50);
-  const int paper = s_paper_offset + params.paper;
-  const int film  = params.film;
-  for(int l=0;l<=SN;l++)
+  [[unroll]]
+  for(int i=0; i<10; i++)
   {
-    float lambda = 380.0 + l*400.0/SN;
-    vec4 dye_density = texture(img_filmsim, vec2((l*(80.0/SN)+0.5)/256.0,
-          get_tcy(s_dye_density, params.process != 1 ? paper : film)));
-    dye_density = mix(dye_density, vec4(1000000.0), isnan(dye_density));
-    float density_spectral = dot(vec3(1), density_cmy * dye_density.xyz);
-    if(params.process != 1) density_spectral += dye_density.w * dye_density_min_factor_paper;
-    else                    density_spectral += dye_density.w * dye_density_min_factor_film;
-    float scan_illuminant = (4.0/(SN+1.0))*sigmoid_eval(coeff, lambda);
-    float light = pow(10.0, -density_spectral) * scan_illuminant;
-    vec3 cmf = cmf_1931(lambda); // 1931 2 deg std observer, approximate version
-    raw += light * cmf;
+    vec4 ds = density_cmy.x * shared_scan_dye_r[i] + 
+              density_cmy.y * shared_scan_dye_g[i] + 
+              density_cmy.z * shared_scan_dye_b[i];
+    vec4 light = exp2(-ds);
+    raw.r += dot(light, shared_scan_factor_r[i]);
+    raw.g += dot(light, shared_scan_factor_g[i]);
+    raw.b += dot(light, shared_scan_factor_b[i]);
+  }
+  { // i=10 (lambda_arr[10] = vec4(780, 790, 800, 810))
+    // tid <= 40 evaluates up to lambda=780nm
+    float ds = density_cmy.x * shared_scan_dye_r[10].x + 
+               density_cmy.y * shared_scan_dye_g[10].x + 
+               density_cmy.z * shared_scan_dye_b[10].x;
+    float light = exp2(-ds);
+    raw.r += light * shared_scan_factor_r[10].x;
+    raw.g += light * shared_scan_factor_g[10].x;
+    raw.b += light * shared_scan_factor_b[10].x;
   }
   raw = clamp(raw, vec3(0.0), vec3(14.0));
   return XYZ_to_rec2020(raw);

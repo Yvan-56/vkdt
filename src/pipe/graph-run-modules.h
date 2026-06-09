@@ -120,12 +120,27 @@ init_display_flags(dt_graph_t *graph, dt_module_t *module)
       int extra_flag = s_conn_double_buffer;
       if(qvk.blit_supported && module->inst == dt_token("main"))
         extra_flag |= s_conn_mipmap;
+      // mark output connector feeding this display for concurrent queue sharing when:
+      // - a gui is attached (i.e. this is a live darkroom session, not batch export)
+      // - the hardware has a dedicated async compute queue family
+      // - no rasterisation nodes are present (draw/overlay use the graphics queue and
+      //   cannot be submitted on a pure compute queue)
+      if(graph->gui_attached &&
+         qvk.queue_family_compute != qvk.queue_family_graphics)
+      {
+        int has_graphics_node = 0;
+        for(int n=0;n<graph->num_nodes;n++)
+          if(graph->node[n].type == s_node_graphics) { has_graphics_node = 1; break; }
+        if(!has_graphics_node)
+          extra_flag |= s_conn_concurrent;
+      }
       c->flags |= extra_flag;
 
       // find node corresponding to our display module
       int ni = c->associated.i;
       int nc = c->associated.c;
       c = graph->node[ni].connector + nc;
+      if(dt_cid_unset(c->connected)) return;
       int ni1 = c->connected.i;
       int nc1 = c->connected.c;
       graph->node[ni1].connector[nc1].flags |= extra_flag;
@@ -595,11 +610,16 @@ dt_graph_run_modules(
         .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
         .descriptorCount = 1,
         .stageFlags = VK_SHADER_STAGE_ALL,
+      },{
+        .binding = 2, // node local buffer device addresses
+        .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+        .descriptorCount = 1,
+        .stageFlags = VK_SHADER_STAGE_ALL,
       }};
       VkDescriptorSetLayoutCreateInfo dset_layout_info = {
         .flags        = VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT,
         .sType        = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
-        .bindingCount = 2,
+        .bindingCount = 3,
         .pBindings    = bindings,
       };
       QVKR(vkCreateDescriptorSetLayout(qvk.device, &dset_layout_info, 0, &graph->uniform_dset_layout));
@@ -713,13 +733,9 @@ dt_graph_run_modules(
       vkDestroyPipelineLayout     (qvk.device, graph->node[i].pipeline_layout,  0);
       vkDestroyPipeline           (qvk.device, graph->node[i].pipeline,         0);
       vkDestroyDescriptorSetLayout(qvk.device, graph->node[i].dset_layout,      0);
-      vkDestroyFramebuffer        (qvk.device, graph->node[i].draw_framebuffer, 0);
-      vkDestroyRenderPass         (qvk.device, graph->node[i].draw_render_pass, 0);
       graph->node[i].pipeline_layout = 0;
       graph->node[i].pipeline = 0;
       graph->node[i].dset_layout = 0;
-      graph->node[i].draw_framebuffer = 0;
-      graph->node[i].draw_render_pass = 0;
       dt_raytrace_node_cleanup    (graph->node + i);
     }
     dt_raytrace_graph_cleanup(graph);

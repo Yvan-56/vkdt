@@ -142,6 +142,20 @@ void render_nodes_right_panel()
 
 void render_nodes()
 {
+  if(vkdt.wstate.interact_begin) dt_gui_set_lod(vkdt.wstate.lod_interact);
+  if(vkdt.wstate.interact_end) dt_gui_set_lod(vkdt.wstate.lod_fine);
+  if(vkdt.wstate.scroll_busy > 0)
+  {
+    dt_gui_set_lod(vkdt.wstate.lod_interact);
+    vkdt.wstate.scroll_busy--;
+    if(vkdt.wstate.scroll_busy == 0)
+      dt_gui_set_lod(vkdt.wstate.lod_fine);
+  }
+  if(!vkdt.wstate.grabbed && !vkdt.ctx.input.mouse.buttons[NK_BUTTON_LEFT].down && vkdt.wstate.active_widget_modid >= 0 && vkdt.wstate.active_widget_is_slider)
+  {
+    widget_end();
+  }
+
   static int resize_panel = 0;
   resize_panel = dt_resize_panel(resize_panel);
 
@@ -166,15 +180,15 @@ void render_nodes()
   }
   nk_style_pop_style_item(&vkdt.ctx);
 
-  dt_graph_t *g = &vkdt.graph_dev;
+  dt_graph_t *graph = &vkdt.graph_dev;
 
   if(nodes.do_layout)
   {
     uint32_t mod_id[100];       // module id, including disconnected modules
-    assert(g->num_modules < sizeof(mod_id)/sizeof(mod_id[0]));
-    for(uint32_t k=0;k<g->num_modules;k++) mod_id[k] = k;
-    dt_module_t *const arr = g->module;
-    const int arr_cnt = g->num_modules;
+    assert(graph->num_modules < sizeof(mod_id)/sizeof(mod_id[0]));
+    for(uint32_t k=0;k<graph->num_modules;k++) mod_id[k] = k;
+    dt_module_t *const arr = graph->module;
+    const int arr_cnt = graph->num_modules;
     int pos = 0, pos2 = 0; // find pos2 as the swapping position, where mod_id[pos2] = curr
     uint32_t modid[100], cnt = 0;
     for(int m=0;m<arr_cnt;m++)
@@ -199,18 +213,18 @@ void render_nodes()
       uint32_t tmp = mod_id[pos];
       mod_id[pos++] = mod_id[pos2];
       mod_id[pos2] = tmp;
-      if(!g->module[curr].name) continue;
-      if(g->module[curr].gui_x == 0 && g->module[curr].gui_y == 0)
+      if(!graph->module[curr].name) continue;
+      if(graph->module[curr].gui_x == 0 && graph->module[curr].gui_y == 0)
       {
-        if(strncmp(dt_token_str(g->module[curr].name), "i-", 2))
+        if(strncmp(dt_token_str(graph->module[curr].name), "i-", 2))
         {
-          g->module[curr].gui_x = nodew*(m+0.25);
-          g->module[curr].gui_y = nodey;
+          graph->module[curr].gui_x = nodew*(m+0.25);
+          graph->module[curr].gui_y = nodey;
         }
         else // input nodes get their own vertical alignment
         {
-          g->module[curr].gui_x = 0;
-          g->module[curr].gui_y = vpos;
+          graph->module[curr].gui_x = 0;
+          graph->module[curr].gui_y = vpos;
           vpos += nodew;
         }
       }
@@ -218,16 +232,16 @@ void render_nodes()
 
     for(int m=pos;m<arr_cnt;m++)
     { // position disconnected modules
-      if(!g->module[mod_id[m]].name) continue;
-      if(g->module[mod_id[m]].gui_x == 0 && g->module[mod_id[m]].gui_y == 0)
+      if(!graph->module[mod_id[m]].name) continue;
+      if(graph->module[mod_id[m]].gui_x == 0 && graph->module[mod_id[m]].gui_y == 0)
       {
-        g->module[mod_id[m]].gui_x = nodew*(m+0.25-pos);
-        g->module[mod_id[m]].gui_x = 2*nodey;
+        graph->module[mod_id[m]].gui_x = nodew*(m+0.25-pos);
+        graph->module[mod_id[m]].gui_x = 2*nodey;
       }
     }
   }
 
-  dt_node_editor(ctx, &nodes.nedit, g);
+  dt_node_editor(ctx, &nodes.nedit, graph);
 
   NK_UPDATE_ACTIVE;
   nk_end(ctx); // end center nodes view

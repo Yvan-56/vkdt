@@ -15,7 +15,7 @@ jobs:
   AppImage:
     if: github.repository == 'hanatos/vkdt'
     name: nightly appimage
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
@@ -27,9 +27,9 @@ jobs:
         compiler:
           - {
               compiler: clang,
-              CC: clang-17,
-              CXX: clang++-17,
-              packages: clang-17 libomp-17-dev,
+              CC: clang-20,
+              CXX: clang++-20,
+              packages: clang-20 libomp-20-dev,
             }
     env:
       CC: ${{ matrix.compiler.CC }}
@@ -44,7 +44,7 @@ jobs:
           # Remove azure mirror because it is unreliable and sometimes unpredictably leads to failed CI
           sudo sed -i 's/azure\.//' /etc/apt/sources.list
           wget -O - https://apt.llvm.org/llvm-snapshot.gpg.key|sudo apt-key add -
-          sudo add-apt-repository "deb http://apt.llvm.org/noble/ llvm-toolchain-noble-17 main"
+          sudo add-apt-repository "deb http://apt.llvm.org/noble/ llvm-toolchain-noble-20 main"
           sudo apt-get update
           sudo apt-get -y install \
             ${{ matrix.compiler.packages }}
@@ -55,7 +55,6 @@ jobs:
             appstream-util \
             git \
             glslang-tools \
-            libvulkan-dev \
             libjpeg-dev \
             zlib1g-dev \
             libasound2-dev \
@@ -67,6 +66,12 @@ jobs:
             libxi-dev \
             libfuse2 \
             appstream;
+          sudo apt-get remove libvulkan-dev
+      - name: install vulkan sdk
+        uses: humbletim/install-vulkan-sdk@v1.2
+        with:
+          version: 1.4.350.0
+          cache: true
       - name: install extra deps for rawler
         if: matrix.raw.backend == 'rawler'
         run: |
@@ -91,6 +96,10 @@ jobs:
           echo "export OPT_CFLAGS" >> bin/config.mk
           echo "OPT_LDFLAGS=" >> bin/config.mk
           echo "export OPT_LDFLAGS" >> bin/config.mk
+          echo "VKDT_VULKAN_CFLAGS=-I${VULKAN_SDK}/include" >> bin/config.mk
+          echo "VKDT_VULKAN_LDFLAGS=-L${VULKAN_SDK}/lib -lvulkan" >> bin/config.mk
+          echo "GLSLC=${VULKAN_SDK}/bin/glslangValidator" >> bin/config.mk
+          echo "export VKDT_VULKAN_CFLAGS VKDT_VULKAN_LDFLAGS GLSLC" >> bin/config.mk
       - name: configure for local glfw
         run: |
           echo "VKDT_GLFW_CFLAGS=-I${{ github.workspace }}/glfw/include" >> bin/config.mk
@@ -140,8 +149,8 @@ jobs:
           VKDT_EXIV2_CFLAGS=$(eval VKDT_EXIV2_CFLAGS := $$(shell pkg-config --cflags exiv2))$(VKDT_EXIV2_CFLAGS)
           VKDT_EXIV2_LDFLAGS=$(eval VKDT_EXIV2_LDFLAGS := $$(shell pkg-config --libs exiv2))$(VKDT_EXIV2_LDFLAGS)
           export VKDT_EXIV2_CFLAGS VKDT_EXIV2_LDFLAGS
-          CC=clang-17
-          CXX=clang++-17
+          CC=clang-20
+          CXX=clang++-20
           export CC CXX
           EOF
       - name: build and install

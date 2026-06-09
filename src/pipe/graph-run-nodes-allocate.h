@@ -138,7 +138,6 @@ write_descriptor_sets(
       { // dynamic arrays will only initialise the descriptor set necessary for the current frame
         // since the frames refer to the odd/even pipelines and not to feedback buffers used in the same
         // command buffer:
-        fprintf(stderr, "owner dynamic array write desc\n");
         for(int k=0;k<MAX(1,c->array_length);k++)
         {
           dt_connector_image_t *img = dt_graph_connector_image(graph,
@@ -256,7 +255,7 @@ write_descriptor_sets(
             (c->type == dt_token("sink") || c->format == dt_token("ui32") || c->format == dt_token("atom")) ? qvk.tex_sampler_nearest :
             qvk.tex_sampler,
           .imageView   = img->image_view,
-          .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+          .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
         };
       }
       VkWriteDescriptorSet img_dset = {
@@ -301,7 +300,7 @@ write_descriptor_sets(
               (c->type == dt_token("sink") || c->format == dt_token("ui32") || c->format == dt_token("atom")) ? qvk.tex_sampler_nearest :
               qvk.tex_sampler,
             .imageView   = img->image_view,
-            .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
           };
         }
       }
@@ -323,11 +322,22 @@ bind_buffers_to_memory(
   if(!dt_connector_owner(c)) return VK_SUCCESS;
   if(f > 0 && c->frames < 2) return VK_SUCCESS; // this is just a copy, not a real double buffer
   dt_connector_image_t *img = dt_graph_connector_image(graph, node - graph->node, c - node->connector, k, f);
+  // fprintf(stderr, "conn %"PRItkn" %"PRItkn" %"PRItkn" off %ld..%ld\n",
+  //     dt_token_str(node->module->name),
+  //     dt_token_str(node->module->inst),
+  //     dt_token_str(node->kernel),
+  //     img->offset, img->offset + img->size);
+  VkDeviceMemory mem = graph->vkmem;
+  if(img->mem->heap == &(graph->heap_protected))
+    mem = graph->vkmem_protected;
+  else if(img->mem->heap == &(graph->heap_1))
+    mem = graph->vkmem_1;
+  
   if(dt_connector_ssbo(c))
   { // storage buffer
     if(img->image_view) vkDestroyImageView(qvk.device, img->image_view, VK_NULL_HANDLE);
     img->image_view = 0;
-    QVKR(vkBindBufferMemory(qvk.device, img->buffer, graph->vkmem, img->offset));
+    QVKR(vkBindBufferMemory(qvk.device, img->buffer, mem, img->offset));
   }
   else
   { // storage image
@@ -349,20 +359,20 @@ bind_buffers_to_memory(
         .sType        = VK_STRUCTURE_TYPE_BIND_IMAGE_MEMORY_INFO,
         .pNext        = &bind_image_plane0_info,
         .image        = img->image,
-        .memory       = graph->vkmem,
+        .memory       = mem,
         .memoryOffset = img->offset,
       },{
         .sType        = VK_STRUCTURE_TYPE_BIND_IMAGE_MEMORY_INFO,
         .pNext        = &bind_image_plane1_info,
         .image        = img->image,
-        .memory       = graph->vkmem,
+        .memory       = mem,
         .memoryOffset = img->offset + img->plane1_offset,
       }};
       QVKR(vkBindImageMemory2(qvk.device, 2, bind_image_memory_infos));
     }
     else
     { // plain:
-      QVKR(vkBindImageMemory(qvk.device, img->image, graph->vkmem, img->offset));
+      QVKR(vkBindImageMemory(qvk.device, img->image, mem, img->offset));
     }
 
     VkSamplerYcbcrConversionInfo ycbcr_info = {
@@ -385,6 +395,16 @@ bind_buffers_to_memory(
     };
     if(img->image_view) vkDestroyImageView(qvk.device, img->image_view, VK_NULL_HANDLE);
     QVKR(vkCreateImageView(qvk.device, &images_view_create_info, NULL, &img->image_view));
+    if (img->mip_levels > 1)
+    {
+      for (uint32_t m = 0; m < img->mip_levels; m++)
+      {
+        images_view_create_info.subresourceRange.baseMipLevel = m;
+        images_view_create_info.subresourceRange.levelCount = 1;
+        if(img->mipmap_views[m]) vkDestroyImageView(qvk.device, img->mipmap_views[m], VK_NULL_HANDLE);
+        QVKR(vkCreateImageView(qvk.device, &images_view_create_info, NULL, &img->mipmap_views[m]));
+      }
+    }
   }
   return VK_SUCCESS;
 }
@@ -437,7 +457,7 @@ alloc_alias_memory(dt_graph_t *graph, dt_node_t *node)
       if(c->flags & s_conn_dynamic_array)
       { // this is shit and should probably get a fake alignment value for a fake image.
         // amd requires this large one, nvidia can do one 0 less
-        c->array_mem = dt_vkalloc_protected(&graph->heap, c->array_heap_size, 0x10000);
+        c->array_mem = dt_vkalloc(&graph->heap_protected, c->array_heap_size, 0x10000);
         c->array_heap = calloc(sizeof(dt_vkalloc_t), 1);
         dt_vkalloc_init(c->array_heap, c->array_length * 2, c->array_heap_size);
       }
@@ -449,11 +469,24 @@ alloc_alias_memory(dt_graph_t *graph, dt_node_t *node)
               nid, cid, aid, f);
           memory_requirements(c, img, &mem_req);
           if(c->flags & s_conn_protected) // allocate protected memory
-            img->mem = dt_vkalloc_protected(&graph->heap, mem_req.size, mem_req.alignment);
+            img->mem = dt_vkalloc(&graph->heap_protected, mem_req.size, mem_req.alignment);
           else
+          {
             img->mem = dt_vkalloc(&graph->heap, mem_req.size, mem_req.alignment);
+            if(img->mem->offset + mem_req.size >= ((uint64_t)1)<<32)
+            { // vk will hate us for this. storage image bindings won't work. try overflow heap:
+              dt_vkfree(&graph->heap, img->mem);
+              img->mem = dt_vkalloc(&graph->heap_1, mem_req.size, mem_req.alignment);
+            }
+          }
           img->offset = img->mem->offset;
           img->size   = dt_connector_bufsize(c, c->roi.wd, c->roi.ht);
+          // fprintf(stderr, "image offset [0x%zx, 0x%zx) %"PRItkn":%"PRItkn":%"PRItkn" (%.1f/%.1fMB) %s\n",
+          //     img->offset, img->offset + img->size,
+          //     dt_token_str(node->name), dt_token_str(node->module->inst), dt_token_str(c->name),
+          //     img->size / 1024.0/1024.0,
+          //     mem_req.size / 1024.0/1024.0,
+          //     (c->flags & s_conn_protected) ? "protected" : (img->mem->heap == &graph->heap_1) ? "overflow" : "");
         }
       }
     }
@@ -461,11 +494,11 @@ alloc_alias_memory(dt_graph_t *graph, dt_node_t *node)
     {
       vkGetBufferMemoryRequirements(qvk.device, c->staging[0], &mem_req);
       int need_dbuf = node->flags & s_module_request_read_source; // only good for sources
-      size_t staging_size = need_dbuf ? mem_req.size * 2 : mem_req.size;
+      size_t staging_size  = need_dbuf ? mem_req.size * 2 : mem_req.size;
       c->mem_staging       = dt_vkalloc(&graph->heap_staging, staging_size, mem_req.alignment);
       c->offset_staging[0] = c->mem_staging->offset;
       c->offset_staging[1] = need_dbuf ? c->mem_staging->offset + mem_req.size : c->mem_staging->offset;
-      // fprintf(stderr, "allocing staging dbuf %d %"PRItkn"_%"PRItkn"_%"PRItkn"@%d [%lx,%lx)\n",
+      // fprintf(stderr, "allocing staging dbuf %d %"PRItkn"_%"PRItkn"_%"PRItkn"@%d [%ld,%ld)\n",
       //     need_dbuf, dt_token_str(node->module->name), dt_token_str(node->kernel), dt_token_str(c->name),
       //     0, c->mem_staging->offset, c->mem_staging->offset + staging_size);
     }
@@ -484,7 +517,7 @@ alloc_alias_memory(dt_graph_t *graph, dt_node_t *node)
         // this could logically happen on the connector, we don't have more fine grained access:
         if(img->nid_last_ref == nid) // free this buffer, be it output or input
         {
-          dt_vkfree(&graph->heap, img->mem);
+          dt_vkfree(img->mem->heap, img->mem);
           img->nid_last_ref = -1; // avoid double free
         }
       }
@@ -532,12 +565,20 @@ alloc_descriptor_sets(dt_graph_t *graph, dt_node_t *node)
       .range       = node->module->uniform_size ? node->module->uniform_size : graph->uniform_global_size,
     },{
       .buffer      = graph->uniform_buffer,
+      .offset      = node->bref_size ? node->bref_offset : 0,
+      .range       = node->bref_size ? node->bref_size   : graph->uniform_global_size,
+    },{
+      .buffer      = graph->uniform_buffer,
       .offset      = graph->uniform_size,
       .range       = graph->uniform_global_size,
     },{
       .buffer      = graph->uniform_buffer,
       .offset      = graph->uniform_size + (node->module->uniform_size ? node->module->uniform_offset : 0),
       .range       = node->module->uniform_size ? node->module->uniform_size : graph->uniform_global_size,
+    },{
+      .buffer      = graph->uniform_buffer,
+      .offset      = graph->uniform_size + node->bref_size ? node->bref_offset : 0,
+      .range       = node->bref_size ? node->bref_size : graph->uniform_global_size,
     }};
     VkWriteDescriptorSet buf_dset[] = {{
       .sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
@@ -557,8 +598,8 @@ alloc_descriptor_sets(dt_graph_t *graph, dt_node_t *node)
       .pBufferInfo     = uniform_info+1,
     },{
       .sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-      .dstSet          = node->uniform_dset[1],
-      .dstBinding      = 0,
+      .dstSet          = node->uniform_dset[0],
+      .dstBinding      = 2,
       .dstArrayElement = 0,
       .descriptorCount = 1,
       .descriptorType  = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
@@ -566,42 +607,29 @@ alloc_descriptor_sets(dt_graph_t *graph, dt_node_t *node)
     },{
       .sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
       .dstSet          = node->uniform_dset[1],
-      .dstBinding      = 1,
+      .dstBinding      = 0,
       .dstArrayElement = 0,
       .descriptorCount = 1,
       .descriptorType  = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
       .pBufferInfo     = uniform_info+3,
+    },{
+      .sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+      .dstSet          = node->uniform_dset[1],
+      .dstBinding      = 1,
+      .dstArrayElement = 0,
+      .descriptorCount = 1,
+      .descriptorType  = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+      .pBufferInfo     = uniform_info+4,
+    },{
+      .sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+      .dstSet          = node->uniform_dset[1],
+      .dstBinding      = 2,
+      .dstArrayElement = 0,
+      .descriptorCount = 1,
+      .descriptorType  = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+      .pBufferInfo     = uniform_info+5,
     }};
-    vkUpdateDescriptorSets(qvk.device, 4, buf_dset, 0, NULL);
-  }
-
-  if(node->type == s_node_graphics)
-  { // create framebuffer for draw connectors
-    VkImageView attachment[DT_MAX_CONNECTORS];
-    int cnt = 0, first = -1;
-    for(int i=0;i<node->num_connectors;i++) if(dt_connector_owner(node->connector+i))
-    { // make sure there is no array and make sure they are same res!
-      if(first == -1) first = i;
-      assert(node->connector[i].array_length <= 1);
-      assert(node->connector[i].roi.wd == 
-             node->connector[first].roi.wd);
-      assert(node->connector[i].roi.ht == 
-             node->connector[first].roi.ht);
-
-      dt_connector_image_t *img  = dt_graph_connector_image(graph,
-          node - graph->node, i, 0, 0);
-      attachment[cnt++] = img->image_view;
-    }
-    VkFramebufferCreateInfo fb_create_info = {
-      .sType           = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
-      .renderPass      = node->draw_render_pass,
-      .attachmentCount = cnt,
-      .pAttachments    = attachment,
-      .width           = node->connector[first].roi.wd,
-      .height          = node->connector[first].roi.ht,
-      .layers          = 1,
-    };
-    if(cnt) QVKR(vkCreateFramebuffer(qvk.device, &fb_create_info, NULL, &node->draw_framebuffer));
+    vkUpdateDescriptorSets(qvk.device, 6, buf_dset, 0, NULL);
   }
   return VK_SUCCESS;
 }
@@ -685,6 +713,9 @@ create_image(
   const uint32_t wd = MAX(1, c->array_dim ? c->array_dim[2*k+0] : c->roi.wd);
   const uint32_t ht = MAX(1, c->array_dim ? c->array_dim[2*k+1] : c->roi.ht);
   VkFormat format = dt_connector_vkformat(c);
+  uint32_t queue_indices[] = { qvk.queue_family_graphics, qvk.queue_family_compute };
+  int is_concurrent = (c->flags & s_conn_concurrent) != 0;
+
   VkImageCreateInfo images_create_info = {
     .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
     .flags = c->format == dt_token("yuv") ? VK_IMAGE_CREATE_DISJOINT_BIT : 0,
@@ -712,7 +743,9 @@ create_image(
       | VK_IMAGE_USAGE_TRANSFER_DST_BIT
       | VK_IMAGE_USAGE_SAMPLED_BIT
       | VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT,
-    .sharingMode           = VK_SHARING_MODE_EXCLUSIVE,
+    .sharingMode           = is_concurrent ? VK_SHARING_MODE_CONCURRENT : VK_SHARING_MODE_EXCLUSIVE,
+    .queueFamilyIndexCount = is_concurrent ? 2 : 0,
+    .pQueueFamilyIndices   = is_concurrent ? queue_indices : 0,
     .initialLayout         = VK_IMAGE_LAYOUT_UNDEFINED,
   };
   // fprintf(stderr, "DEBUG allocating imag %"PRItkn":%"PRItkn":%"PRItkn":%"PRItkn" %d x %d\n", dt_token_str(node->name), dt_token_str(node->module->inst), dt_token_str(node->kernel), dt_token_str(c->name), wd, ht);
@@ -758,7 +791,7 @@ create_buffers(dt_graph_t *graph, dt_node_t *node)
     { // free any potential residuals of dynamic allocation
       dt_vkalloc_cleanup(c->array_heap);
       free(c->array_heap);
-      c->array_heap= 0;
+      c->array_heap = 0;
       c->array_heap_size = 0;
       c->array_mem = 0; // freeing will not do anything, since it's protected. this will only go away via nuking/graph_reset
     }
@@ -818,10 +851,12 @@ alloc_outputs(dt_graph_t *graph, dt_node_t *node)
 {
   // create descriptor bindings and pipeline:
   // we'll bind our buffers in the same order as in the connectors file.
-  uint32_t drawn_connector_cnt = 0;
-  uint32_t drawn_connector[DT_MAX_CONNECTORS];
+  int drawn_connector = -1;
   VkDescriptorSetLayoutBinding bindings[DT_MAX_CONNECTORS] = {{0}};
   const int nid = node - graph->node;
+  const size_t uniform_alignment = 64;
+  graph->uniform_size = uniform_alignment*((graph->uniform_size + uniform_alignment-1)/uniform_alignment);
+  node->bref_offset = graph->uniform_size;
   for(int cid=0;cid<node->num_connectors;cid++)
   {
     dt_connector_t *c = node->connector+cid;
@@ -845,6 +880,8 @@ alloc_outputs(dt_graph_t *graph, dt_node_t *node)
     { // might be "read"|"write"|"sink"|"source"|"modify" we don't care
       graph->dset_cnt_buffer += MAX(1, node->connector[cid].array_length);
       bindings[cid].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+      // ssbo are handed down via buffer references
+      graph->uniform_size += sizeof(uint64_t);
     }
     else if(node->connector[cid].type == dt_token("read") ||
             node->connector[cid].type == dt_token("sink"))
@@ -856,52 +893,16 @@ alloc_outputs(dt_graph_t *graph, dt_node_t *node)
     {
       graph->dset_cnt_image_write += MAX(1, node->connector[cid].array_length);
       bindings[cid].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-      if(node->type == s_node_graphics)
-        drawn_connector[drawn_connector_cnt++] = cid;
+      if(node->type == s_node_graphics && drawn_connector == -1)
+        drawn_connector = cid;
     }
     bindings[cid].descriptorCount = MAX(1, node->connector[cid].array_length);
     bindings[cid].stageFlags = VK_SHADER_STAGE_ALL;//COMPUTE_BIT;
     bindings[cid].pImmutableSamplers = node->connector[cid].format == dt_token("yuv") ?
       &qvk.tex_sampler_yuv : 0;
   }
-
-  // create render pass in case we need rasterised output:
-  if(drawn_connector_cnt)
-  {
-    VkAttachmentDescription attachment_desc[DT_MAX_CONNECTORS];
-    VkAttachmentReference color_attachment[DT_MAX_CONNECTORS];
-    for(int i=0;i<drawn_connector_cnt;i++)
-    {
-      int k = drawn_connector[i];
-      attachment_desc[i] = (VkAttachmentDescription) {
-        .format         = dt_connector_vkformat(node->connector+k),
-        .samples        = VK_SAMPLE_COUNT_1_BIT,
-        .loadOp         = VK_ATTACHMENT_LOAD_OP_CLEAR, // VK_ATTACHMENT_LOAD_OP_DONT_CARE, // select on s_conn_clear flag?
-        .storeOp        = VK_ATTACHMENT_STORE_OP_STORE,
-        .stencilLoadOp  = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
-        .stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
-        .initialLayout  = VK_IMAGE_LAYOUT_UNDEFINED,
-        .finalLayout    = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-      };
-      color_attachment[i] = (VkAttachmentReference) {
-        .attachment = i,
-        .layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-      };
-    }
-    VkSubpassDescription subpass = {
-      .pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS,
-      .colorAttachmentCount = drawn_connector_cnt,
-      .pColorAttachments = color_attachment,
-    };
-    VkRenderPassCreateInfo info = {
-      .sType           = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO,
-      .attachmentCount = drawn_connector_cnt,
-      .pAttachments    = attachment_desc,
-      .subpassCount    = 1,
-      .pSubpasses      = &subpass,
-    };
-    QVK(vkCreateRenderPass(qvk.device, &info, 0, &node->draw_render_pass));
-  }
+  graph->uniform_size = uniform_alignment*((graph->uniform_size + uniform_alignment-1)/uniform_alignment);
+  node->bref_size = graph->uniform_size - node->bref_offset;
 
   // a sink needs a descriptor set (for display via gui)
   if(!dt_node_source(node))
@@ -940,10 +941,10 @@ alloc_outputs(dt_graph_t *graph, dt_node_t *node)
     };
     QVKR(vkCreatePipelineLayout(qvk.device, &layout_info, 0, &node->pipeline_layout));
 
-    if(drawn_connector_cnt)
+    if(drawn_connector > -1)
     { // create rasterisation pipeline
-      const int wd = node->connector[drawn_connector[0]].roi.wd;
-      const int ht = node->connector[drawn_connector[0]].roi.ht;
+      const int wd = node->connector[drawn_connector].roi.wd;
+      const int ht = node->connector[drawn_connector].roi.ht;
       VkShaderModule shader_module_vert, shader_module_frag;
       QVKR(dt_graph_create_shader_module(graph, node->name, node->kernel, "vert", &shader_module_vert));
       QVKR(dt_graph_create_shader_module(graph, node->name, node->kernel, "frag", &shader_module_frag));
@@ -1000,6 +1001,12 @@ alloc_outputs(dt_graph_t *graph, dt_node_t *node)
         .scissorCount  = 1,
         .pScissors     = &scissor,
       };
+      VkPipelineDepthStencilStateCreateInfo depth_state = {
+        .sType             = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO,
+        .depthTestEnable   = VK_FALSE,
+        .depthWriteEnable  = VK_FALSE,
+        .stencilTestEnable = VK_FALSE,
+      };
 
       VkPipelineRasterizationStateCreateInfo rasterizer_state = {
         .sType                   = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
@@ -1034,8 +1041,8 @@ alloc_outputs(dt_graph_t *graph, dt_node_t *node)
         .srcColorBlendFactor = VK_BLEND_FACTOR_SRC_COLOR,
         .dstColorBlendFactor = VK_BLEND_FACTOR_DST_COLOR,
         .colorBlendOp        = VK_BLEND_OP_MAX,
-        .srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE,
-        .dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE,
+        .srcAlphaBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA,
+        .dstAlphaBlendFactor = VK_BLEND_FACTOR_ZERO,
         .alphaBlendOp        = VK_BLEND_OP_MAX,
       };
 
@@ -1048,8 +1055,23 @@ alloc_outputs(dt_graph_t *graph, dt_node_t *node)
         .blendConstants  = { 0.0f, 0.0f, 0.0f, 0.0f },
       };
 
+#if 0
+      VkPipelineCreateFlags2CreateInfo pipeline2_info = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_CREATE_FLAGS_2_CREATE_INFO,
+        .flags = VK_PIPELINE_CREATE_2_64_BIT_INDEXING_BIT_EXT,
+      };
+#endif
+      VkFormat attachment_fmt = dt_connector_vkformat(node->connector+drawn_connector);
+      VkPipelineRenderingCreateInfo pipeline_create = {
+        .sType                   = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO_KHR,
+        // .pNext                   = qvk.shader64bit_indexing_supported ? (void*)&pipeline2_info : 0,
+        .colorAttachmentCount    = 1,
+        .pColorAttachmentFormats = &attachment_fmt,
+      };
+
       VkGraphicsPipelineCreateInfo pipeline_info = {
         .sType      = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
+        .pNext      = &pipeline_create,
         .stageCount = LENGTH(shader_info),
         .pStages    = shader_info,
 
@@ -1058,14 +1080,10 @@ alloc_outputs(dt_graph_t *graph, dt_node_t *node)
         .pViewportState      = &viewport_state,
         .pRasterizationState = &rasterizer_state,
         .pMultisampleState   = &multisample_state,
-        .pDepthStencilState  = NULL,
+        .pDepthStencilState  = &depth_state,
         .pColorBlendState    = &color_blend_state,
         .pDynamicState       = NULL,
-
         .layout              = node->pipeline_layout,
-        .renderPass          = node->draw_render_pass,
-        .subpass             = 0,
-
         .basePipelineHandle  = VK_NULL_HANDLE,
         .basePipelineIndex   = -1,
       };
@@ -1098,10 +1116,17 @@ alloc_outputs(dt_graph_t *graph, dt_node_t *node)
       };
 
       // finally create the pipeline
+#if 0
+      VkPipelineCreateFlags2CreateInfo pipeline2_info = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_CREATE_FLAGS_2_CREATE_INFO,
+        .flags = VK_PIPELINE_CREATE_2_64_BIT_INDEXING_BIT_EXT,
+      };
+#endif
       VkComputePipelineCreateInfo pipeline_info = {
         .sType  = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
         .stage  = stage_info,
-        .layout = node->pipeline_layout
+        .layout = node->pipeline_layout,
+        // .pNext  = qvk.shader64bit_indexing_supported ? (void*)&pipeline2_info : 0,
       };
       QVKR(vkCreateComputePipelines(qvk.device, VK_NULL_HANDLE, 1, &pipeline_info, 0, &node->pipeline));
 
@@ -1145,13 +1170,13 @@ dt_graph_run_nodes_allocate(
     QVKR(dt_raytrace_graph_init(graph, nodeid, cnt));
     // free pipeline resources if previously allocated anything:
     dt_vkalloc_nuke(&graph->heap);
+    dt_vkalloc_nuke(&graph->heap_1);
+    dt_vkalloc_nuke(&graph->heap_protected);
     dt_vkalloc_nuke(&graph->heap_staging);
     graph->dset_cnt_image_read = 0;
     graph->dset_cnt_image_write = 0;
     graph->dset_cnt_buffer = 0;
     graph->dset_cnt_uniform = DT_GRAPH_MAX_FRAMES; // we have one global uniform for params, per frame
-    graph->memory_type_bits = ~0u;
-    graph->memory_type_bits_staging = ~0u;
     for(int i=0;i<cnt;i++)
       QVKR(alloc_outputs(graph, graph->node+nodeid[i]));
   }
@@ -1188,6 +1213,54 @@ dt_graph_run_nodes_allocate(
     };
     QVKR(vkAllocateMemory(qvk.device, &mem_alloc_info, 0, &graph->vkmem));
     graph->vkmem_size = graph->heap.vmsize;
+  }
+
+  if(graph->heap_1.vmsize > graph->vkmem_1_size)
+  {
+    *run |= s_graph_run_upload_source; // new mem means new source
+    if(graph->vkmem_1)
+    {
+      vkFreeMemory(qvk.device, graph->vkmem_1, 0);
+      graph->vkmem_1 = 0;
+    }
+    graph->vkmem_1_size = 0;
+    QVKR(dt_check_device_allocation(graph->heap_1.vmsize, 0));
+    VkMemoryAllocateFlagsInfo allocation_flags = {
+      .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO,
+      .flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT,
+    };
+    VkMemoryAllocateInfo mem_alloc_info = {
+      .sType           = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+      .pNext           = &allocation_flags,
+      .allocationSize  = graph->heap_1.vmsize,
+      .memoryTypeIndex = qvk_memory_get_device(),
+    };
+    QVKR(vkAllocateMemory(qvk.device, &mem_alloc_info, 0, &graph->vkmem_1));
+    graph->vkmem_1_size = graph->heap_1.vmsize;
+  }
+
+  if(graph->heap_protected.vmsize > graph->vkmem_protected_size)
+  {
+    *run |= s_graph_run_upload_source; // new mem means new source
+    if(graph->vkmem_protected)
+    {
+      vkFreeMemory(qvk.device, graph->vkmem_protected, 0);
+      graph->vkmem_protected = 0;
+    }
+    graph->vkmem_protected_size = 0;
+    QVKR(dt_check_device_allocation(graph->heap_protected.vmsize, 0));
+    VkMemoryAllocateFlagsInfo allocation_flags = {
+      .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO,
+      .flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT,
+    };
+    VkMemoryAllocateInfo mem_alloc_info = {
+      .sType           = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+      .pNext           = &allocation_flags,
+      .allocationSize  = graph->heap_protected.vmsize,
+      .memoryTypeIndex = qvk_memory_get_device(),
+    };
+    QVKR(vkAllocateMemory(qvk.device, &mem_alloc_info, 0, &graph->vkmem_protected));
+    graph->vkmem_protected_size = graph->heap_protected.vmsize;
   }
 
   if(graph->heap_staging.vmsize > graph->vkmem_staging_size)
@@ -1287,7 +1360,7 @@ dt_graph_run_nodes_allocate(
         .descriptorCount = 1+DT_GRAPH_MAX_FRAMES*graph->dset_cnt_buffer,
       }, {
         .type            = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
-        .descriptorCount = 1+DT_GRAPH_MAX_FRAMES*2*graph->num_nodes,
+        .descriptorCount = 1+DT_GRAPH_MAX_FRAMES*3*graph->num_nodes,
       }, {
         .type            = qvk.raytracing_supported ?
           VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR :
@@ -1406,5 +1479,31 @@ dt_graph_run_nodes_allocate(
         QVKR(write_descriptor_sets(graph, graph->node+nid, graph->node[nid].connector+cid));
     }
   }
+
+  if(*run & s_graph_run_alloc)
+  { // write buffer device addresses to uniform memory
+    uint64_t *map = 0;
+    QVKR(vkMapMemory(qvk.device, graph->vkmem_uniform, 0, VK_WHOLE_SIZE, 0, (void**)&map));
+    for(int i=0;i<cnt;i++)
+    {
+      const int nid = nodeid[i];
+      int j = 0;
+      for(int f=0;f<2;f++) for(int cid=0;cid<graph->node[nid].num_connectors;cid++)
+      { // don't support ssbo arrays
+        if(dt_connector_ssbo(graph->node[nid].connector+cid))
+        {
+          dt_connector_image_t *img = dt_graph_connector_image(graph, nid, cid, 0, f);
+          VkBufferDeviceAddressInfo address_info = {
+            .sType  = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO_KHR,
+            .buffer = img->buffer,
+          };
+          int idx = (f*graph->uniform_size + graph->node[nid].bref_offset)/sizeof(uint64_t) + j++;
+          map[idx] = vkGetBufferDeviceAddress(qvk.device, &address_info);
+        }
+      }
+    }
+    vkUnmapMemory(qvk.device, graph->vkmem_uniform);
+  }
+
   return VK_SUCCESS;
 }
