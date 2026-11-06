@@ -172,6 +172,13 @@ dt_thumbnails_init(
   for(int i=0;i<tn->thumb_max;i++)
     QVKR(vkAllocateDescriptorSets(qvk.device, &dset_info, &tn->thumb[i].dset));
 
+  uint32_t id = 0;
+  if(dt_thumbnails_load_one(tn, "data/busybee.bc1", &id) != VK_SUCCESS)
+  {
+    dt_log(s_log_err|s_log_db, "could not load required thumbnail symbols!");
+    return VK_INCOMPLETE;
+  }
+
   return VK_SUCCESS;
 }
 
@@ -499,7 +506,7 @@ dt_thumbnails_load_one(
   struct stat statbuf = {0};
   if(stat(imgfilename, &statbuf)) return VK_INCOMPLETE;
 
-  dt_graph_repurpose(graph);
+  QVKR(dt_graph_repurpose(graph));
   int m0 = dt_module_add(graph, dt_token("i-bc1"), dt_token("main"));
   int m1 = dt_module_add(graph, dt_token("thumb"), dt_token("main"));
   if(m0 < 0 || m1 < 0)
@@ -582,18 +589,12 @@ dt_thumbnails_load_one(
   if(mem_req.memoryTypeBits != tn->memory_type_bits)
     dt_log(s_log_qvk|s_log_err, "[thm] memory type bits don't match!");
 
-  if(tn->alloc.vmsize + mem_req.size > tn->alloc.heap_size)
-  { // uhm not enough memory, trigger reset of all thumbnail references
-    // reload will be triggered by ui
-    *thumb_index = 0;
-    return VK_ERROR_OUT_OF_DATE_KHR;
-  }
-
   dt_vkmem_t *mem = dt_vkalloc(&tn->alloc, mem_req.size, mem_req.alignment);
   if(!mem)
-  {
-    dt_log(s_log_err, "[thm] no more thumbnail gpu memory allocation possible!");
-    return VK_INCOMPLETE; // probably fragmented memory
+  { // reload will be triggered by ui
+    dt_log(s_log_mem, "[thm] no more thumbnail gpu memory allocation possible!");
+    *thumb_index = 0;
+    return VK_ERROR_OUT_OF_DATE_KHR;
   }
 
   assert(mem);
@@ -650,7 +651,7 @@ dt_thumbnails_load_one(
 
   // reset here too to make sure cleanup() is called on all modules.
   // this releases file descriptors and webcams etc.
-  dt_graph_repurpose(graph);
+  QVKR(dt_graph_repurpose(graph));
 
   return VK_SUCCESS;
 }

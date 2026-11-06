@@ -88,7 +88,8 @@ enum hotkey_names_t
   s_hotkey_dragkey_yinc     = 39,
   s_hotkey_dragkey_ydec_alt = 40,
   s_hotkey_dragkey_yinc_alt = 41,
-  s_hotkey_count            = 42,
+  s_hotkey_color_assessment = 42,
+  s_hotkey_count            = 43,
 };
 
 static const int hk_darkroom_size = 128;
@@ -137,6 +138,7 @@ static hk_t hk_darkroom[128] = {
   {"dragkey y-inc",     "step armed parameter up",              {GLFW_KEY_UP}},
   {"dragkey y-dec alt", "step armed parameter down (alt)",      {GLFW_KEY_J}},
   {"dragkey y-inc alt", "step armed parameter up (alt)",        {GLFW_KEY_K}},
+  {"color assessment", "toggle color assessment mode", {GLFW_KEY_LEFT_CONTROL, GLFW_KEY_B}},
 };
 
 // used to communicate between the gui helper functions
@@ -211,6 +213,15 @@ darkroom_keyboard(GLFWwindow *window, int key, int scancode, int action, int mod
   { // active widget grabs controls
     if(action == GLFW_PRESS && (key == GLFW_KEY_ESCAPE || key == GLFW_KEY_CAPS_LOCK))
     { // abort all widget interaction
+      int modid = vkdt.wstate.active_widget_modid;
+      int parid = vkdt.wstate.active_widget_parid;
+      if(vkdt.graph_dev.module[modid].so->param[parid]->widget.type == dt_token("pers"))
+      { // perspective: put back the quad, rotation and crop saved at start
+        memcpy(vkdt.wstate.state, vkdt.wstate.state+14, sizeof(float)*8);
+        dt_module_set_param_float(vkdt.graph_dev.module+modid, dt_token("rotate"), vkdt.wstate.state[9]);
+        dt_module_set_param_float_n(vkdt.graph_dev.module+modid, dt_token("crop"), vkdt.wstate.state+10, 4);
+        vkdt.graph_dev.runflags = s_graph_run_all;
+      }
       widget_end();
     }
     else if(action == GLFW_PRESS && key == GLFW_KEY_ENTER)
@@ -232,6 +243,7 @@ darkroom_keyboard(GLFWwindow *window, int key, int scancode, int action, int mod
     }
     return;
   }
+  dt_gui_darkroom_dspy_keyboard(window, key, action, mods);
 
   int mr = dt_menu_keyboard(&darkroom_menu, hk_darkroom, hk_darkroom_cnt, key, action, mods);
   if(mr == 1) return;
@@ -284,6 +296,10 @@ hotkey_dispatch:
       break;
     case s_hotkey_dopesheet:
       dt_gui_dr_toggle_dopesheet();
+      break;
+    case s_hotkey_color_assessment:
+      vkdt.wstate.color_assessment ^= 1;
+      dt_image_reset_zoom(&vkdt.wstate.img_widget);
       break;
     case s_hotkey_rate_0: dt_gui_rate_0(); break;
     case s_hotkey_rate_1: dt_gui_rate_1(); break;
@@ -410,7 +426,6 @@ void render_darkroom()
   int win_x = vkdt.state.center_x,  win_y = vkdt.state.center_y;
   int win_w = vkdt.state.center_wd, win_h = vkdt.state.center_ht - vkdt.wstate.dopesheet_view;
   struct nk_rect bounds = {win_x, win_y, win_w, win_h};
-  const int display_frame = vkdt.graph_dev.double_buffer % 2;
   if(!dt_gui_input_blocked() && !vkdt.wstate.dragkey_latched && nk_input_is_mouse_click_in_rect(&vkdt.ctx.input, NK_BUTTON_DOUBLE, bounds))
   {
     dt_view_switch(s_view_lighttable);
@@ -446,13 +461,10 @@ void render_darkroom()
     dt_node_t *out_main = dt_graph_get_display(&vkdt.graph_dev, dt_token("main"));
     if(out_main)
     {
-      if(vkdt.graph_res[display_frame] == VK_SUCCESS)
-      {
-        int events = !vkdt.wstate.grabbed && !disabled;
-        // center view has on-canvas widgets (but only if there *is* an image):
-        nk_layout_row_dynamic(&vkdt.ctx, win_h, 1);
-        dt_image(&vkdt.ctx, &vkdt.wstate.img_widget, out_main, events, out_main != 0);
-      }
+      int events = !vkdt.wstate.grabbed && !disabled;
+      // center view has on-canvas widgets (but only if there *is* an image):
+      nk_layout_row_dynamic(&vkdt.ctx, win_h, 1);
+      dt_image(&vkdt.ctx, &vkdt.wstate.img_widget, out_main, events, out_main != 0, 1);
     }
     float wd = 0.8*win_y;
     const uint32_t ci = dt_db_current_imgid(&vkdt.db);
@@ -528,8 +540,9 @@ void render_darkroom()
         }
 
         if(action >= 2)
-        { // read previous cfg or factory default cfg, first init modules to their default state:
-          for(uint32_t m=0;m<vkdt.graph_dev.num_modules;m++) dt_module_reset_params(vkdt.graph_dev.module+m);
+        { // read previous cfg or factory default cfg into an empty graph, so modules added since are gone too
+          dt_graph_repurpose(&vkdt.graph_dev);
+          vkdt.graph_dev.gui_attached = 1;
           dt_graph_read_config_ascii(&vkdt.graph_dev, graph_cfg);
         }
 
@@ -595,13 +608,13 @@ void render_darkroom()
   { // right panel
     // draw histogram image:
     dt_node_t *out_hist = dt_graph_get_display(&vkdt.graph_dev, dt_token("hist"));
-    if(out_hist && vkdt.graph_res[display_frame] == VK_SUCCESS && out_hist->dset[display_frame])
+    if(out_hist)
     {
+      dt_image_widget_t imgw = { .look_at_x = 0, .look_at_y = 0, .scale=1.0 };
       int wd = vkdt.state.panel_wd;
       int ht = wd * out_hist->connector[0].roi.full_ht / (float)out_hist->connector[0].roi.full_wd; // image aspect
-      nk_layout_row_dynamic(&vkdt.ctx, ht, 1);
-      struct nk_image img = nk_image_ptr(out_hist->dset[display_frame]);
-      nk_image(ctx, img);
+      nk_layout_row_dynamic(ctx, ht, 1);
+      dt_image(ctx, &imgw, out_hist, 0, 0, 0);
     }
 
     static dt_image_widget_t imgw[] = {
@@ -611,13 +624,12 @@ void render_darkroom()
     for(uint32_t d = 0; d < sizeof(dsp)/sizeof(dsp[0]); d++)
     {
       dt_node_t *out = dt_graph_get_display(&vkdt.graph_dev, dsp[d]);
-      if(out && vkdt.graph_res[display_frame] == VK_SUCCESS)
+      if(out)
       {
-        struct nk_context *ctx = &vkdt.ctx;
         int wd = vkdt.state.panel_wd;
         int ht = wd * out->connector[0].roi.full_ht / (float)out->connector[0].roi.full_wd; // image aspect
         nk_layout_row_dynamic(ctx, ht, 1);
-        dt_image(ctx, imgw+d, out, 1, 0);
+        dt_image(ctx, imgw+d, out, 1, 0, 0);
       }
     }
 
@@ -675,7 +687,7 @@ void render_darkroom()
       }
       nk_size anim_frame = vkdt.state.anim_frame;
       struct nk_rect bb = nk_widget_bounds(ctx);
-      if(nk_progress(ctx, &anim_frame, vkdt.state.anim_max_frame, nk_true))
+      if(nk_progress(ctx, &anim_frame, vkdt.graph_dev.frame_cnt-1, nk_true))
       {
         vkdt.state.anim_frame = anim_frame;
         vkdt.graph_dev.frame = vkdt.state.anim_frame;
@@ -686,7 +698,7 @@ void render_darkroom()
       char text[50];
       bb.x += ctx->style.progress.padding.x;
       bb.y += ctx->style.progress.padding.y;
-      snprintf(text, sizeof(text), "frame %d/%d", vkdt.state.anim_frame, vkdt.state.anim_max_frame);
+      snprintf(text, sizeof(text), "frame %d/%d", vkdt.state.anim_frame, vkdt.graph_dev.frame_cnt);
       nk_draw_text(nk_window_get_canvas(ctx), bb, text, strlen(text), nk_glfw3_font(0), nk_rgba(0,0,0,0), nk_rgba(255,255,255,255));
     }
 
@@ -779,6 +791,30 @@ void render_darkroom()
           dt_gui_edit_hotkeys();
         if(nk_button_label(ctx, "toggle perf overlay"))
           vkdt.wstate.show_perf_overlay ^= 1;
+        dt_tooltip("toggle color assessment mode");
+        if(nk_button_label(ctx, "toggle color assessment"))
+        {
+          vkdt.wstate.color_assessment ^= 1;
+          dt_image_reset_zoom(&vkdt.wstate.img_widget);
+        }
+        dt_tooltip("outer margin size of the color assessment frame as fraction of the window size");
+        nk_layout_row(ctx, NK_DYNAMIC, row_height, 2, ratio);
+        float old_ca_margin = vkdt.style.color_assessment_margin;
+        nk_tab_property(float, ctx, "#", 0.01f, &vkdt.style.color_assessment_margin, 0.5f, 0.01f, 0.01f);
+        nk_label(ctx, "color assessment margin", NK_TEXT_LEFT);
+        if(old_ca_margin != vkdt.style.color_assessment_margin)
+        {
+          dt_image_reset_zoom(&vkdt.wstate.img_widget);
+          dt_rc_set_float(&vkdt.rc, "gui/color_assessment_margin", vkdt.style.color_assessment_margin);
+        }
+
+        dt_tooltip("white frame thickness as fraction of the window size");
+        nk_layout_row(ctx, NK_DYNAMIC, row_height, 2, ratio);
+        float old_ca_frame_wd = vkdt.style.color_assessment_frame_wd;
+        nk_tab_property(float, ctx, "#", 0.001f, &vkdt.style.color_assessment_frame_wd, 0.1f, 0.001f, 0.001f);
+        nk_label(ctx, "color assessment frame width", NK_TEXT_LEFT);
+        if(old_ca_frame_wd != vkdt.style.color_assessment_frame_wd)
+          dt_rc_set_float(&vkdt.rc, "gui/color_assessment_frame_wd", vkdt.style.color_assessment_frame_wd);
         nk_layout_row(ctx, NK_DYNAMIC, row_height, 2, ratio);
 
         dt_tooltip("level of detail: 1 means full res, any higher number will render on reduced resolution.");
@@ -797,12 +833,11 @@ void render_darkroom()
       if(nk_tree_push(ctx, NK_TREE_TAB, "animation", NK_MINIMIZED))
       { // animation controls
         nk_layout_row(ctx, NK_DYNAMIC, row_height, 2, ratio);
-        int resi = vkdt.state.anim_max_frame;
+        int resi = vkdt.graph_dev.frame_cnt-1;
         nk_tab_property(int, ctx, "#", 0, &resi, 10000, 1, 1);
-        if(resi != vkdt.state.anim_max_frame) 
+        if(resi != vkdt.graph_dev.frame_cnt-1)
         {
-          vkdt.state.anim_max_frame = resi;
-          vkdt.graph_dev.frame_cnt = vkdt.state.anim_max_frame+1;
+          vkdt.graph_dev.frame_cnt = resi+1;
           dt_graph_history_global(&vkdt.graph_dev);
         }
         nk_label(ctx, "last frame", NK_TEXT_LEFT);
@@ -907,9 +942,9 @@ void render_darkroom()
   dt_menu_process_clicks(&darkroom_menu, hk_darkroom, hk_darkroom_cnt);
   if(vkdt.wstate.pending_modid >= 0)
   {
-    if(vkdt.wstate.dragkey_latched)
-      vkdt.graph_dev.active_module = vkdt.wstate.pending_modid; // just scroll; full activate triggers s_graph_run_all which glitches display
-    else
+    // we want to be able to use drag keys without opening the active module. one use case is for instance
+    // looking at the histogram in `filmcurv` while using exposure to move the data closer to the shoulder of the curve.
+    if(!vkdt.wstate.dragkey_latched)
       dt_darkroom_activate_module(vkdt.wstate.pending_modid);
     vkdt.wstate.pending_modid = -1;
   }
@@ -982,7 +1017,7 @@ static void darkroom_menu_action(const char *action)
       if(modid >= 0)
       {
         dt_module_t *m = vkdt.graph_dev.module + modid;
-        if(m->so->ui_callback) m->so->ui_callback(m, param);
+        if(m->so->ui_callback) m->so->ui_callback(m, param, 0.0f);
         vkdt.graph_dev.runflags |= s_graph_run_record_cmd_buf;
         vkdt.graph_dev.active_module = modid;
         dt_graph_history_append(&vkdt.graph_dev, modid, -1, 0);
@@ -1129,6 +1164,23 @@ darkroom_mouse_position(GLFWwindow* window, double x, double y)
   }
 }
 
+static inline void
+clear_runflags()
+{ // graph_run has completed (and cleared runflags already)
+  if(!dt_graph_get_display(&vkdt.graph_dev, dt_token("main")))
+    dt_gui_notification("graph does not contain a display:main node!");
+
+  // do this after running the graph, it may only know
+  // after initing say the output roi, after loading an input file
+  if(vkdt.graph_dev.frame_cnt == 1) dt_gui_dr_hide_dopesheet();
+
+  vkdt.graph_dev.runflags = 0; // in any case we processed this.
+  if(vkdt.graph_res[vkdt.graph_dev.double_buffer] != VK_SUCCESS)
+    dt_gui_notification("running the graph failed (%s)!",
+        qvk_result_to_string(vkdt.graph_res[vkdt.graph_dev.double_buffer]));
+  else vkdt.graph_res[vkdt.graph_dev.double_buffer] = -1; // mark as pending/still running
+}
+
 void
 darkroom_process()
 {
@@ -1163,6 +1215,7 @@ darkroom_process()
         vkdt.graph_dev.runflags = 0; // no need to re-render
       else advance = 1;
     }
+    // fprintf(stderr, "adv %d frame %d/%d anim frame %d\n", advance, vkdt.graph_dev.frame, vkdt.graph_dev.frame_cnt, vkdt.state.anim_frame);
     if(advance)
     {
       if(vkdt.state.anim_frame > vkdt.graph_dev.frame + 1)
@@ -1170,7 +1223,7 @@ darkroom_process()
       vkdt.graph_dev.frame = vkdt.state.anim_frame;
       if(!vkdt.state.anim_no_keyframes)
         dt_graph_apply_keyframes(&vkdt.graph_dev);
-      if(vkdt.graph_dev.frame_cnt == 0 || vkdt.state.anim_frame < vkdt.state.anim_max_frame+1)
+      if(vkdt.graph_dev.frame_cnt == 0 || vkdt.state.anim_frame < vkdt.graph_dev.frame_cnt)
         vkdt.graph_dev.runflags = s_graph_run_record_cmd_buf;
     }
     if(vkdt.state.anim_frame == vkdt.graph_dev.frame_cnt - 1)
@@ -1181,55 +1234,22 @@ darkroom_process()
     start_time = (struct timespec){0};
   }
 
-  const int grabbed = vkdt.wstate.grabbed;
-  // the grabbed mode is *much* faster (schedules next frame directly and doesn't spin down clocks)
-  // XXX FIXME: when resetting animations, keeps garbage in the double buffer (need to reset the result)
-  if(!grabbed && !(advance && (vkdt.graph_dev.frame_rate == 0.0)))
   { // async graph compute vs. sync cpu + gui rendering
-    // graph->double_buffer points to the buffer currently locked for render/display
-    // set graph_res = -1 initially (when entering dr mode) so we won't draw before it finished processing
-    static int running = 0; // 1-double buffer is still running on gpu, has not been swapped in yet
-    if(vkdt.graph_res[vkdt.graph_dev.double_buffer^1] == -1)
-      running = 1; // when entering dr mode graph_res is -1 and it will kick off 0 as running
-
-    if((!running && vkdt.graph_dev.runflags) || // stills and stopped animations
-       (!running && vkdt.graph_dev.runflags && vkdt.state.anim_playing && advance)) // running animations only if frame advances
+    int needs_run = vkdt.graph_dev.runflags;//  && dt_graph_display_have_free_process(&vkdt.graph_dev);
+    int have_free = dt_graph_display_have_free_process(&vkdt.graph_dev);
+    if(needs_run && have_free)
     { // double buffered async compute
+      if(vkdt.graph_dev.runflags & s_graph_run_create_nodes)
+      {
+        dt_gui_rebuild_fav(); // rebuild gui specific to this module list
+        // dt_image_reset_zoom(&vkdt.wstate.img_widget); // not sure if helpful at all
+      }
       vkdt.graph_dev.double_buffer ^= 1; // work on the one that's not currently locked
       vkdt.graph_res[vkdt.graph_dev.double_buffer] =
         dt_graph_run(&vkdt.graph_dev, (vkdt.graph_dev.runflags & ~s_graph_run_wait_done));
-      if(vkdt.graph_res[vkdt.graph_dev.double_buffer] != VK_SUCCESS)
-        dt_gui_notification("failed to run the graph %s!",
-            qvk_result_to_string(vkdt.graph_res[vkdt.graph_dev.double_buffer]));
-      vkdt.graph_dev.runflags = 0; // clear this here, running graph has a copy.
-      vkdt.graph_dev.double_buffer ^= 1; // reset to the locked/already finished one
-      running = 1;
-    }
-    if(running)
-    {
-      uint64_t value;
-      VkResult res = vkGetSemaphoreCounterValue(qvk.device, vkdt.graph_dev.semaphore_process, &value);
-      if(res == VK_SUCCESS && value >= vkdt.graph_dev.process_dbuffer[vkdt.graph_dev.double_buffer^1])
-      {
-        if(vkdt.graph_res[vkdt.graph_dev.double_buffer^1] == -1)
-          vkdt.graph_res[vkdt.graph_dev.double_buffer^1] = VK_SUCCESS; // let display now it's now good to show
-        running = 0;
-        vkdt.graph_dev.double_buffer ^= 1; // flip double buffer frame
-      }
-    }
-  }
-  else // if grabbed
-  { // swap double buffers and run for grabbed animations
-    if(vkdt.graph_dev.runflags) // stills and stopped animations have 0 runflag
-    { // double buffered compute
-      // this will wait for other run
-      // process double_buffer, wait for double_buffer^1
-      vkdt.graph_res[vkdt.graph_dev.double_buffer] =
-        dt_graph_run(&vkdt.graph_dev, (vkdt.graph_dev.runflags & ~s_graph_run_wait_done));
-      if(vkdt.graph_res[vkdt.graph_dev.double_buffer] != VK_SUCCESS)
-        dt_gui_notification("failed to run the graph %s!",
-            qvk_result_to_string(vkdt.graph_res[vkdt.graph_dev.double_buffer]));
-      vkdt.graph_dev.runflags = 0; // we started this
+      clear_runflags();
+#if 0
+      // fast lockstep animation mode: wait for the other backbuffer to finish, so we have something for the ui:
       VkSemaphoreWaitInfo wait_info = {
         .sType          = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO,
         .semaphoreCount = 1,
@@ -1239,47 +1259,7 @@ darkroom_process()
       VkResult res = vkWaitSemaphores(qvk.device, &wait_info, ((uint64_t)1)<<30);
       if(res == VK_SUCCESS)
         vkdt.graph_dev.double_buffer ^= 1; // lock ^1 as display buffer, we waited for it to complete
-      // double-click reset: the reset rendered into the just-kicked slot but the display
-      // still shows the previous slot. schedule one more grabbed run so the new result
-      // becomes the display buffer, and post an empty event to wake glfwWaitEvents.
-      if(dragkeys.pending_runflags)
-      {
-        vkdt.graph_dev.runflags |= dragkeys.pending_runflags;
-        dragkeys.pending_runflags = 0;
-        glfwPostEmptyEvent();
-      }
-    }
-  }
-
-  if(vkdt.state.anim_playing && advance)
-  { // new frame for animations need new audio, too
-    dt_graph_t *g = &vkdt.graph_dev;
-    for(int i=0;i<g->num_modules;i++)
-    { // find first audio module, if any
-      if(g->module[i].name == 0) continue;
-      if(g->module[i].so->audio)
-      {
-        uint16_t *samples;
-        if(g->frame_rate > 0)
-        { // fixed frame rate, maybe video
-          int samples_per_frame = g->module[i].img_param.snd_samplerate / g->frame_rate;
-          uint64_t pos = g->frame * samples_per_frame;
-          uint32_t left = samples_per_frame;
-          while(left)
-          {
-            int cnt = g->module[i].so->audio(g->module+i, pos, left, &samples);
-            left -= cnt; pos += cnt;
-            if(cnt > 0) dt_snd_play(&vkdt.snd, samples, cnt);
-            else break;
-          }
-        }
-        else
-        { // go as fast as we can, probably a game engine. ask only once
-          int cnt = g->module[i].so->audio(g->module+i, 0, 0, &samples);
-          if(cnt > 0) dt_snd_play(&vkdt.snd, samples, cnt);
-        }
-        break;
-      }
+#endif
     }
   }
 }
@@ -1323,6 +1303,8 @@ darkroom_enter()
 
   if(!vkdt.graph_dev.module)
     dt_graph_init(&vkdt.graph_dev, s_queue_compute);
+  vkdt.graph_dev.dspy = &vkdt.dspy;
+  vkdt.graph_dev.dspy_acquire = &dt_graph_display_acquire_for_processing;
   vkdt.graph_dev.gui_attached = 1;
   vkdt.graph_dev.gui_colour[0] = vkdt.style.colour[NK_COLOR_DT_ACCENT].r/255.0f;
   vkdt.graph_dev.gui_colour[1] = vkdt.style.colour[NK_COLOR_DT_ACCENT].g/255.0f;
@@ -1387,38 +1369,11 @@ darkroom_enter()
     else vkdt.graph_dev.active_module = -1;
   }
 
-  // do this to track usage of external files. not sure how to best wire it in the ui:
-  // dt_graph_alloc_external_resources(&vkdt.graph_dev);
   dt_gui_set_lod(vkdt.wstate.lod_fine);
   vkdt.graph_dev.runflags = s_graph_run_all;
   vkdt.graph_res[0] = vkdt.graph_res[1] = VK_INCOMPLETE; // invalidate
-  vkdt.graph_dev.double_buffer = 0; // graph_init does this too, but let's be explicit
-  if((vkdt.graph_res[vkdt.graph_dev.double_buffer] =
-        dt_graph_run(&vkdt.graph_dev, s_graph_run_all & ~s_graph_run_wait_done)) != VK_SUCCESS)
-    dt_gui_notification("running the graph failed (%s)!",
-        qvk_result_to_string(vkdt.graph_res[vkdt.graph_dev.double_buffer]));
-  if(vkdt.graph_res[vkdt.graph_dev.double_buffer] == VK_SUCCESS)
-    vkdt.graph_res[vkdt.graph_dev.double_buffer] = -1;
-  vkdt.graph_dev.double_buffer = 1; // we are rendering to 0, make sure the display code uses this dset after swapping
-  dt_graph_print_external_resources(&vkdt.graph_dev);
-  dt_graph_free_external_resources(&vkdt.graph_dev);
 
-  // nodes are only constructed after running once
-  // (could run up to s_graph_run_create_nodes)
-  if(!dt_graph_get_display(&vkdt.graph_dev, dt_token("main")))
-    dt_gui_notification("graph does not contain a display:main node!");
-
-  // do this after running the graph, it may only know
-  // after initing say the output roi, after loading an input file
-  vkdt.state.anim_max_frame = vkdt.graph_dev.frame_cnt-1;
-
-  // rebuild gui specific to this image
   dt_gui_read_favs("darkroom.ui");
-#if 1//ndef QVK_ENABLE_VALIDATION // debug build does not reset zoom (reload shaders keeping focus is nice)
-  dt_image_reset_zoom(&vkdt.wstate.img_widget);
-#endif
-
-  if(vkdt.graph_dev.frame_cnt == 1) dt_gui_dr_hide_dopesheet();
 
   dt_gamepadhelp_set(dt_gamepadhelp_button_circle, "back to lighttable");
   dt_gamepadhelp_set(dt_gamepadhelp_ps, "toggle this help");
@@ -1466,13 +1421,17 @@ darkroom_leave()
     gui.active_instance = vkdt.graph_dev.module[vkdt.graph_dev.active_module].inst;
   }
 
-  // TODO: start from already loaded/inited graph instead of from scratch!
+  // cpu synced thumbnail update: just grab the current display image and write to bc1:
+  dt_graph_display_write_thumbnail();
+#if 0
+  // this re-decodes the raw file and introduces like an extra 1s lag while doing so:
   const uint32_t imgid = dt_db_current_imgid(&vkdt.db);
   dt_thumbnails_cache_list(
       &vkdt.thumbnail_gen,
       &vkdt.db,
       &imgid, 1,
       &glfwPostEmptyEvent);
+#endif
 
   dt_graph_repurpose(&vkdt.graph_dev);
   dt_graph_history_cleanup(&vkdt.graph_dev);
@@ -1562,7 +1521,7 @@ darkroom_gamepad(GLFWwindow *window, GLFWgamepadstate *last, GLFWgamepadstate *c
   dt_node_t *out_main = dt_graph_get_display(&vkdt.graph_dev, dt_token("main"));
   if(out_main)
   {
-    const float sensitivity = 0.001 * dt_rc_get_float(&vkdt.rc, "gui/joystick_sensitivity", 1.0f);
+    const float sensitivity = vkdt.wstate.delta_time * dt_rc_get_float(&vkdt.rc, "gui/joystick_sensitivity", 1.0f);
 #define SMOOTH(X) copysignf(MAX(0.0f, fabsf(X) - 0.05f), X)
     float wd  = (float)out_main->connector[0].roi.wd;
     float ht  = (float)out_main->connector[0].roi.ht;
@@ -1583,4 +1542,20 @@ darkroom_gamepad(GLFWwindow *window, GLFWgamepadstate *last, GLFWgamepadstate *c
 #undef SMOOTH
   }
 #undef PRESSED
+}
+
+uint32_t darkroom_snd_process(uint8_t **buf, uint32_t size)
+{
+  if(vkdt.state.anim_playing)
+  { // new frame for animations need new audio, too
+    dt_graph_t *g = &vkdt.graph_dev;
+    for(int i=0;i<g->num_modules;i++)
+    { // find first "main" audio module, if any TODO cache
+      if(g->module[i].name == 0) continue;
+      if(g->module[i].inst != dt_token("main")) continue;
+      if(g->module[i].so->audio)
+        return g->module[i].so->audio(g->module+i, buf, size);
+    }
+  }
+  return 0;
 }

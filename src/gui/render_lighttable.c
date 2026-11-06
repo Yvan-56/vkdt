@@ -8,6 +8,7 @@
 #include "db/hash.h"
 #include "db/exif.h"
 #include "core/fs.h"
+#include "core/xrand.h"
 #include "pipe/graph-defaults.h"
 #include "gui/render_view.h"
 #include "gui/hotkey.h"
@@ -28,7 +29,8 @@
 
 static hk_t hk_lighttable[] = {
   {"tag",           "assign a tag to selected images",  {GLFW_KEY_LEFT_CONTROL,  GLFW_KEY_T}},
-  {"select all",    "toggle select all/none",           {GLFW_KEY_LEFT_CONTROL,  GLFW_KEY_A}},
+  {"select all",    "select all images",                {GLFW_KEY_LEFT_CONTROL,  GLFW_KEY_A}},
+  {"select none",   "select no images",                 {GLFW_KEY_LEFT_SHIFT,    GLFW_KEY_A}},
   {"export",        "export selected images",           {GLFW_KEY_LEFT_CONTROL,  GLFW_KEY_S}},
   {"copy",          "copy from selected image",         {GLFW_KEY_LEFT_CONTROL,  GLFW_KEY_C}},
   {"paste history", "paste history to selected images", {GLFW_KEY_LEFT_CONTROL,  GLFW_KEY_V}},
@@ -56,28 +58,29 @@ typedef enum hotkey_names_t
 {
   s_hotkey_assign_tag    = 0,
   s_hotkey_select_all    = 1,
-  s_hotkey_export        = 2,
-  s_hotkey_copy_hist     = 3,
-  s_hotkey_paste_hist    = 4,
-  s_hotkey_append_preset = 5,
-  s_hotkey_scroll_cur    = 6,
-  s_hotkey_scroll_end    = 7,
-  s_hotkey_scroll_top    = 8,
-  s_hotkey_fullscreen    = 9,
-  s_hotkey_duplicate     = 10,
-  s_hotkey_rate_0        = 11,
-  s_hotkey_rate_1        = 12,
-  s_hotkey_rate_2        = 13,
-  s_hotkey_rate_3        = 14,
-  s_hotkey_rate_4        = 15,
-  s_hotkey_rate_5        = 16,
-  s_hotkey_label_1       = 17,
-  s_hotkey_label_2       = 18,
-  s_hotkey_label_3       = 19,
-  s_hotkey_label_4       = 20,
-  s_hotkey_label_5       = 21,
-  s_hotkey_zoom_in       = 22,
-  s_hotkey_zoom_out      = 23,
+  s_hotkey_select_none   = 2,
+  s_hotkey_export        = 3,
+  s_hotkey_copy_hist     = 4,
+  s_hotkey_paste_hist    = 5,
+  s_hotkey_append_preset = 6,
+  s_hotkey_scroll_cur    = 7,
+  s_hotkey_scroll_end    = 8,
+  s_hotkey_scroll_top    = 9,
+  s_hotkey_fullscreen    = 10,
+  s_hotkey_duplicate     = 11,
+  s_hotkey_rate_0        = 12,
+  s_hotkey_rate_1        = 13,
+  s_hotkey_rate_2        = 14,
+  s_hotkey_rate_3        = 15,
+  s_hotkey_rate_4        = 16,
+  s_hotkey_rate_5        = 17,
+  s_hotkey_label_1       = 18,
+  s_hotkey_label_2       = 19,
+  s_hotkey_label_3       = 20,
+  s_hotkey_label_4       = 21,
+  s_hotkey_label_5       = 22,
+  s_hotkey_zoom_in       = 23,
+  s_hotkey_zoom_out      = 24,
 } hotkey_names_t;
 static dt_menu_t lighttable_menu;
 static int g_hotkey = -1; // to pass hotkey from handler to rendering. necessary for scrolling/export
@@ -116,11 +119,11 @@ lighttable_keyboard(GLFWwindow *w, int key, int scancode, int action, int mods)
     case s_hotkey_label_4: dt_gui_label_4(); return;
     case s_hotkey_label_5: dt_gui_label_5(); return;
     case s_hotkey_assign_tag:
-      dt_gui_lt_assign_tag();
-      return;
+      return dt_gui_lt_assign_tag();
     case s_hotkey_select_all:
-      dt_gui_lt_toggle_select_all();
-      return;
+      return dt_gui_lt_select_all();
+    case s_hotkey_select_none:
+      return dt_gui_lt_select_none();
     case s_hotkey_export: // handled during rendering
     case s_hotkey_scroll_cur:
     case s_hotkey_scroll_end:
@@ -227,28 +230,6 @@ lighttable_keyboard(GLFWwindow *w, int key, int scancode, int action, int mods)
 
 void render_lighttable_center()
 { // center image view
-#if 0 // TODO bring back
-  { // assign star rating/colour labels via gamepad:
-    if(ImGui::IsKeyDown(ImGuiKey_GamepadFaceUp))
-    {
-      const uint32_t *sel = dt_db_selection_get(&vkdt.db);
-      int rtdir = 0, lbdir = 0;
-      rtdir -= ImGui::IsKeyPressed(ImGuiKey_GamepadL1);
-      rtdir += ImGui::IsKeyPressed(ImGuiKey_GamepadR1);
-      lbdir -= ImGui::IsKeyPressed(ImGuiKey_GamepadL2);
-      lbdir += ImGui::IsKeyPressed(ImGuiKey_GamepadR2);
-      for(uint32_t i=0;i<vkdt.db.selection_cnt;i++)
-      {
-        vkdt.db.image[sel[i]].rating = CLAMP(vkdt.db.image[sel[i]].rating + rtdir, 0, 5);
-        if(lbdir)
-        vkdt.db.image[sel[i]].labels =
-          vkdt.db.image[sel[i]].labels ?
-          CLAMP(lbdir > 0 ? (vkdt.db.image[sel[i]].labels << 1) :
-                            (vkdt.db.image[sel[i]].labels >> 1), 0, 8) : 1;
-      }
-    }
-  }
-#endif
   struct nk_rect bounds = {vkdt.state.center_x, vkdt.state.center_y, vkdt.state.center_wd, vkdt.state.center_ht};
   const int disabled = vkdt.wstate.popup;
   nk_style_push_style_item(&vkdt.ctx, &vkdt.ctx.style.window.fixed_background, nk_style_item_color(vkdt.style.colour[NK_COLOR_DT_BACKGROUND]));
@@ -308,12 +289,15 @@ void render_lighttable_center()
   // resources)
   if(triggered_rebuild)
   {
-    uint64_t v0, v1;
-    vkGetSemaphoreCounterValue(qvk.device, vkdt.win.sem_frame_complete[0], &v0);
-    vkGetSemaphoreCounterValue(qvk.device, vkdt.win.sem_frame_complete[1], &v1);
-    if(MIN(v0, v1) >= triggered_rebuild)
+    uint64_t vmin = -1u, v;
+    for(int k=0;k<DT_GUI_MAX_FRAMES_IN_FLIGHT;k++)
+    {
+      vkGetSemaphoreCounterValue(qvk.device, vkdt.win.sem_frame[k], &v);
+      vmin = MIN(vmin, v);
+    }
+    if(vmin >= triggered_rebuild)
     { // triggered a reset
-      uint64_t heap_size = 2*vkdt.thumbnails.alloc.heap_size, pool_size = 2*vkdt.thumbnails.alloc.pool_size;
+      uint64_t heap_size = 2*vkdt.thumbnails.alloc.heap_size, pool_size = 2*vkdt.thumbnails.thumb_max;
       uint32_t wd = vkdt.thumbnails.thumb_wd, ht = vkdt.thumbnails.thumb_ht;
       // kill them all
       dt_thumbnails_cleanup(&vkdt.thumbnails);
@@ -330,7 +314,7 @@ void render_lighttable_center()
   // the cache noticed it is too small. internally it reset all the thumbnail references to zero, so they will not
   // be picked up by further command buffer dispatches. now of course we'll have to wait for the currently pending
   // ones to finish before we can actually delete/reallocate the vulkan resources for thumbnails.
-  if(thumb_res == VK_ERROR_OUT_OF_DATE_KHR)
+  if(thumb_res == VK_ERROR_OUT_OF_DATE_KHR && !triggered_rebuild)
     triggered_rebuild = vkdt.win.frame_global; // timeline semaphore of last frame
   cacheline += iv;
   if(cacheline > vkdt.db.collection_cnt) cacheline = 0;
@@ -424,16 +408,10 @@ void render_lighttable_center()
       }
       else
       { // no modifier, select exactly this image:
-        if(dt_db_selection_contains(&vkdt.db, i) &&
-           nk_input_is_mouse_click_in_rect(&vkdt.ctx.input, NK_BUTTON_DOUBLE, row))
-        {
-          dt_view_switch(s_view_darkroom);
-        }
-        else
-        {
-          dt_db_selection_clear(&vkdt.db);
-          dt_db_selection_add(&vkdt.db, i);
-        }
+        const int is_double = nk_input_is_mouse_click_in_rect(&vkdt.ctx.input, NK_BUTTON_DOUBLE, row);
+        dt_db_selection_clear(&vkdt.db);
+        dt_db_selection_add(&vkdt.db, i);
+        if(is_double) dt_view_switch(s_view_darkroom);
       }
     }
   }
@@ -1593,6 +1571,7 @@ int lighttable_enter()
   dt_gamepadhelp_set(dt_gamepadhelp_arrow_left,      "move left");
   dt_gamepadhelp_set(dt_gamepadhelp_arrow_right,     "move right");
   dt_gamepadhelp_set(dt_gamepadhelp_R1,              "show/hide right panel");
+  dt_gamepadhelp_set(dt_gamepadhelp_analog_stick_L,  "move up/down fast");
   vkdt.wstate.copied_imgid = -1u; // reset to invalid
   vkdt.wstate.lighttable_images_per_row = dt_rc_get_int(&vkdt.rc, "gui/images_per_line", 6);
   dt_gui_read_favs("darkroom.ui"); // read these for fav presets here, too
@@ -1651,4 +1630,15 @@ void lighttable_gamepad(GLFWwindow *window, GLFWgamepadstate *last, GLFWgamepads
     dt_gui_toggle_fullscreen_view();
   }
 #undef PRESSED
+  const float sensitivity = vkdt.wstate.delta_time * dt_rc_get_float(&vkdt.rc, "gui/joystick_sensitivity", 1.0f);
+  float ay = curr->axes[GLFW_GAMEPAD_AXIS_LEFT_Y];
+  int sign = ay > 0 ? 1 : -1;
+#define SMOOTH(X) MAX(0.0f, fabsf(X) - 0.05f)
+  float df = 80*sensitivity * SMOOTH(ay); // 100 rows per second if fully extended
+  if(df > xrand()) // also move for super fast frame rates
+  {
+    int delta = sign * (int)(df+1.0);
+    if(g_image_cursor < 0) g_image_cursor = -2;
+    else g_image_cursor = CLAMP(g_image_cursor+delta*vkdt.wstate.lighttable_images_per_row, 0, vkdt.db.collection_cnt-1);
+  }
 }

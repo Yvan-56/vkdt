@@ -192,6 +192,12 @@ endif
 ifeq ($(VKDT_USE_QUAKE), 1)
 	@echo "quake                  : quakespasm"
 endif
+ifeq ($(VKDT_USE_JXL), 0)
+	@echo "jpeg-xl output         : no"
+endif
+ifeq ($(VKDT_USE_JXL), 1)
+	@echo "jpeg-xl output         : yes"
+endif
 ifeq ($(VKDT_USE_V4L2), 0)
 	@echo "webcam                 : no"
 endif
@@ -204,11 +210,11 @@ endif
 ifeq ($(VKDT_USE_MLV), 1)
 	@echo "magic lantern raw video: mlv"
 endif
-ifeq ($(VKDT_USE_ALSA), 0)
+ifeq ($(VKDT_USE_PIPEWIRE), 0)
 	@echo "sound                  : no"
 endif
-ifeq ($(VKDT_USE_ALSA), 1)
-	@echo "sound                  : alsa"
+ifeq ($(VKDT_USE_PIPEWIRE), 1)
+	@echo "sound                  : pipewire"
 endif
 ifeq ($(VKDT_USE_MCRAW), 0)
 	@echo "motioncam raw video    : no"

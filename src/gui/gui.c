@@ -39,7 +39,6 @@ dt_gui_style_to_state()
     .center_ht  = vkdt.win.height - 2.0f*border,
     .panel_ht   = vkdt.win.height,
     .anim_frame = vkdt.state.anim_frame,
-    .anim_max_frame = vkdt.state.anim_max_frame,
   };
 }
 
@@ -70,7 +69,8 @@ window_size_callback(GLFWwindow* w, int width, int height)
   }
 }
 
-void window_content_scale_callback(GLFWwindow* w, float xscale, float yscale)
+static void
+window_content_scale_callback(GLFWwindow* w, float xscale, float yscale)
 {
   if(w == vkdt.win.window)
   {
@@ -83,6 +83,34 @@ void window_content_scale_callback(GLFWwindow* w, float xscale, float yscale)
     vkdt.win1.content_scale[1] = yscale;
   }
   dt_gui_init_fonts(); // content scale scales fonts
+}
+
+void joystick_callback(int js, int event)
+{
+  if(event == GLFW_CONNECTED)
+  {
+    if(glfwJoystickIsGamepad(js))
+    {
+      const char *name = glfwGetJoystickName(js);
+      dt_log(s_log_gui, "found gamepad %s", name);
+      const int disable = dt_rc_get_int(&vkdt.rc, "gui/disable_joystick", 1);
+      if(disable)
+      {
+        vkdt.wstate.have_joystick = 0;
+        dt_log(s_log_gui, "disabling joystick due to explicit config request. enable by");
+        dt_log(s_log_gui, "setting 'intgui/disable_joystick:0' in ~/.config/vkdt/config.rc");
+      }
+      else
+      {
+        vkdt.wstate.have_joystick = 1;
+        vkdt.wstate.joystick_id = js;
+      }
+    }
+  }
+  else if(event == GLFW_DISCONNECTED)
+  {
+    vkdt.wstate.have_joystick = 0;
+  }
 }
 
 static inline void
@@ -145,8 +173,8 @@ dt_gui_win_init_vk(dt_gui_win_t *win)
   QVKR(dt_gui_recreate_swapchain(win));
 
   // create command pool and fences and semaphores.
-  // assume num_swap_chain_images does not change, so we only need to do this once.
-  for(int i = 0; i < win->num_swap_chain_images; i++)
+  // assume number of images does not change, so we only need to do this once.
+  for(int i = 0; i < DT_GUI_MAX_FRAMES_IN_FLIGHT; i++)
   {
     VkCommandPoolCreateInfo cmd_pool_create_info = {
       .sType            = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
@@ -219,22 +247,28 @@ int dt_gui_init()
   char configfile[512];
   if(snprintf(configfile, sizeof(configfile), "%s/config.rc", dt_pipe.homedir) < 512)
     dt_rc_read(&vkdt.rc, configfile);
+  dt_screencast_init();
+
+  vkdt.style.color_assessment_margin = dt_rc_get_float(&vkdt.rc, "gui/color_assessment_margin", 0.10f);
+  vkdt.style.color_assessment_frame_wd = dt_rc_get_float(&vkdt.rc, "gui/color_assessment_frame_wd", 0.03f);
 
   vkdt.wstate.copied_imgid = -1u; // none copied at startup
   threads_mutex_init(&vkdt.wstate.notification_mutex, 0);
 
   dt_gui_win_init(&vkdt.win);
 
-  // be verbose about monitor names so we can colour manage them:
-  int monitors_cnt;
-  GLFWmonitor** monitors = glfwGetMonitors(&monitors_cnt);
-  for(int i=0;i<monitors_cnt;i++)
-  {
-    const char *name = glfwGetMonitorName(monitors[i]);
-    int xpos, ypos;
-    glfwGetMonitorPos(monitors[i], &xpos, &ypos);
-    dt_log(s_log_gui, "monitor [%d] %s at %d %d", i, name, xpos, ypos);
-    // the corresponding display profile gamma+matrix will be in basedir/profile.<name>
+  if(pt != GLFW_PLATFORM_WAYLAND && pt != GLFW_PLATFORM_COCOA)
+  { // be verbose about monitor names so we can colour manage them (only relevant on ignorant platforms)
+    int monitors_cnt;
+    GLFWmonitor** monitors = glfwGetMonitors(&monitors_cnt);
+    for(int i=0;i<monitors_cnt;i++)
+    {
+      const char *name = glfwGetMonitorName(monitors[i]);
+      int xpos, ypos;
+      glfwGetMonitorPos(monitors[i], &xpos, &ypos);
+      dt_log(s_log_gui, "monitor [%d] %s at %d %d", i, name, xpos, ypos);
+      // the corresponding display profile gamma+matrix will be in basedir/profile.<name>
+    }
   }
 
   if(!vkdt.win.window)
@@ -265,6 +299,7 @@ int dt_gui_init()
   }
 
   if(dt_gui_win_init_vk(&vkdt.win)) return 1;
+  dt_graph_display_images_init(&vkdt.dspy);
 
   { // joystick detection: find first gamepad.
   char filename[PATH_MAX];
@@ -289,23 +324,10 @@ int dt_gui_init()
   vkdt.wstate.have_joystick = 0;
   for(int js=GLFW_JOYSTICK_1;!vkdt.wstate.have_joystick&&js<GLFW_JOYSTICK_LAST;js++)
   {
-    if(glfwJoystickPresent(js) && glfwJoystickIsGamepad(js))
+    if(glfwJoystickPresent(js))
     {
-      const char *name = glfwGetJoystickName(js);
-      dt_log(s_log_gui, "found gamepad %s", name);
-      const int disable = dt_rc_get_int(&vkdt.rc, "gui/disable_joystick", 1);
-      if(disable)
-      {
-        vkdt.wstate.have_joystick = 0;
-        dt_log(s_log_gui, "disabling joystick due to explicit config request. enable by");
-        dt_log(s_log_gui, "setting 'intgui/disable_joystick:0' in ~/.config/vkdt/config.rc");
-      }
-      else
-      {
-        vkdt.wstate.have_joystick = 1;
-        vkdt.wstate.joystick_id = js;
-        break;
-      }
+      joystick_callback(js, GLFW_CONNECTED);
+      if(vkdt.wstate.have_joystick) break;
     }
   }
   if(!vkdt.wstate.have_joystick)
@@ -319,15 +341,15 @@ int dt_gui_init()
 static inline VkResult
 dt_gui_destroy_swapchain(dt_gui_win_t *win)
 {
-  for(int i = 0; i < win->num_swap_chain_images; i++)
+  for(int i = 0; i < win->swapchain_image_cnt; i++)
   {
     if(win->swap_chain_image_views[i]) vkDestroyImageView  (qvk.device, win->swap_chain_image_views[i], 0);
     if(win->framebuffer[i])            vkDestroyFramebuffer(qvk.device, win->framebuffer[i], 0);
-    if(win->render_pass)               vkDestroyRenderPass (qvk.device, win->render_pass, 0);
     win->swap_chain_image_views[i] = 0;
     win->framebuffer[i] = 0;
-    win->render_pass = 0;
   }
+  if(win->render_pass) vkDestroyRenderPass (qvk.device, win->render_pass, 0);
+  win->render_pass = 0;
 
   vkDestroySwapchainKHR(qvk.device, win->swap_chain, NULL);
   win->swap_chain = 0;
@@ -341,8 +363,9 @@ dt_gui_create_swapchain(dt_gui_win_t *win)
   QVKL(&qvk.queue[s_queue_graphics].mutex, vkQueueWaitIdle(qvk.queue[s_queue_graphics].queue));
 
   if(old_swap_chain)
-    for(int i = 0; i < win->num_swap_chain_images; i++)
-      vkDestroyImageView(qvk.device, win->swap_chain_image_views[i], 0);
+    for(int i = 0; i < win->swapchain_image_cnt; i++)
+      if(win->swap_chain_image_views[i])
+        vkDestroyImageView(qvk.device, win->swap_chain_image_views[i], 0);
 
   /* create swapchain */
   VkSurfaceCapabilitiesKHR surf_capabilities;
@@ -469,11 +492,12 @@ out:;
 
   QVKR(vkCreateSwapchainKHR(qvk.device, &swpch_create_info, NULL, &win->swap_chain));
 
-  vkGetSwapchainImagesKHR(qvk.device, win->swap_chain, &win->num_swap_chain_images, NULL);
-  assert(vkdt.win.num_swap_chain_images <= QVK_MAX_SWAPCHAIN_IMAGES);
-  vkGetSwapchainImagesKHR(qvk.device, win->swap_chain, &win->num_swap_chain_images, win->swap_chain_images);
+  win->swapchain_image_cnt = QVK_MAX_SWAPCHAIN_IMAGES;
+  QVKR(vkGetSwapchainImagesKHR(qvk.device, win->swap_chain, &win->swapchain_image_cnt, NULL));
+  assert(win->swapchain_image_cnt <= QVK_MAX_SWAPCHAIN_IMAGES);
+  QVKR(vkGetSwapchainImagesKHR(qvk.device, win->swap_chain, &win->swapchain_image_cnt, win->swap_chain_images));
 
-  for(int i = 0; i < win->num_swap_chain_images; i++)
+  for(int i = 0; i < win->swapchain_image_cnt; i++)
   {
     VkImageViewCreateInfo img_create_info = {
       .sType      = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
@@ -503,7 +527,7 @@ VkResult
 dt_gui_recreate_swapchain(dt_gui_win_t *win)
 {
   QVKLR(&qvk.queue[qvk.qid[s_queue_graphics]].mutex, vkQueueWaitIdle(qvk.queue[qvk.qid[s_queue_graphics]].queue));
-  for(int i = 0; i < win->num_swap_chain_images; i++)
+  for(int i = 0; i < win->swapchain_image_cnt; i++)
     vkDestroyFramebuffer(qvk.device, win->framebuffer[i], 0);
   if(win->render_pass)
     vkDestroyRenderPass(qvk.device, win->render_pass, 0);
@@ -562,24 +586,28 @@ dt_gui_recreate_swapchain(dt_gui_win_t *win)
     .height          = win->height,
     .layers          = 1,
   };
-  for(int i = 0; i < win->num_swap_chain_images; i++)
+  for(int i = 0; i < win->swapchain_image_cnt; i++)
   {
+    if(win->sem_signal [i]) vkDestroySemaphore(qvk.device, win->sem_signal [i], 0);
+    VkSemaphoreCreateInfo semaphore_info = { .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO };
+    QVKR(vkCreateSemaphore(qvk.device, &semaphore_info, NULL, win->sem_signal + i));
     attachment[0] = win->swap_chain_image_views[i];
     QVKR(vkCreateFramebuffer(qvk.device, &fb_create_info, NULL, win->framebuffer + i));
+  }
 
-    if(win->sem_image_acquired[i])  vkDestroySemaphore(qvk.device, win->sem_image_acquired[i], 0);
-    if(win->sem_render_complete[i]) vkDestroySemaphore(qvk.device, win->sem_render_complete[i], 0);
-    if(win->sem_frame_complete [i]) vkDestroySemaphore(qvk.device, win->sem_frame_complete[i], 0);
+  for(int i = 0; i < DT_GUI_MAX_FRAMES_IN_FLIGHT; i++)
+  {
+    if(win->sem_acquire[i]) vkDestroySemaphore(qvk.device, win->sem_acquire[i], 0);
+    if(win->sem_frame  [i]) vkDestroySemaphore(qvk.device, win->sem_frame  [i], 0);
     if(win->fence[i])               vkDestroyFence(qvk.device, win->fence[i], 0);
     VkSemaphoreCreateInfo semaphore_info = { .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO };
-    QVKR(vkCreateSemaphore(qvk.device, &semaphore_info, NULL, win->sem_image_acquired + i));
-    QVKR(vkCreateSemaphore(qvk.device, &semaphore_info, NULL, win->sem_render_complete + i));
+    QVKR(vkCreateSemaphore(qvk.device, &semaphore_info, NULL, win->sem_acquire + i));
     VkSemaphoreTypeCreateInfo timeline_info = {
       .sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO,
       .semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE,
     };
     semaphore_info.pNext = &timeline_info;
-    QVKR(vkCreateSemaphore(qvk.device, &semaphore_info, NULL, win->sem_frame_complete + i));
+    QVKR(vkCreateSemaphore(qvk.device, &semaphore_info, NULL, win->sem_frame + i));
 
     VkFenceCreateInfo fence_info = {
       .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
@@ -588,7 +616,6 @@ dt_gui_recreate_swapchain(dt_gui_win_t *win)
     QVKR(vkCreateFence(qvk.device, &fence_info, NULL, win->fence + i));
   }
   win->frame_index = 0;
-  win->sem_index = 0;
 
   dt_gui_set_hdr_metadata(win, 1000.0f, 0.0f, 1000.0f, 128.0f);
   return VK_SUCCESS;
@@ -597,20 +624,23 @@ dt_gui_recreate_swapchain(dt_gui_win_t *win)
 static inline void
 dt_gui_win_cleanup(dt_gui_win_t *win)
 {
-  for(int i=0;i<win->num_swap_chain_images;i++)
+  for(int i = 0; i < win->swapchain_image_cnt; i++)
+  {
+    vkDestroySemaphore(qvk.device, win->sem_signal[i], 0);
+    win->sem_signal[i] = 0;
+  }
+  for(int i=0;i<DT_GUI_MAX_FRAMES_IN_FLIGHT;i++)
   {
     vkFreeCommandBuffers(qvk.device, win->command_pool[i], 1, &win->command_buffer[i]);
     vkDestroyCommandPool(qvk.device, win->command_pool[i], 0);
-    vkDestroySemaphore(qvk.device, win->sem_image_acquired[i], 0);
-    vkDestroySemaphore(qvk.device, win->sem_render_complete[i], 0);
-    vkDestroySemaphore(qvk.device, win->sem_frame_complete[i], 0);
+    vkDestroySemaphore(qvk.device, win->sem_acquire[i], 0);
+    vkDestroySemaphore(qvk.device, win->sem_frame  [i], 0);
     vkDestroyFence(qvk.device, win->fence[i], 0);
     vkDestroyFramebuffer(qvk.device, win->framebuffer[i], 0);
     win->command_buffer[i] = 0;
     win->command_pool[i] = 0;
-    win->sem_image_acquired[i] = 0;
-    win->sem_render_complete[i] = 0;
-    win->sem_frame_complete[i] = 0;
+    win->sem_acquire[i] = 0;
+    win->sem_frame  [i] = 0;
     win->fence[i] = 0;
     win->framebuffer[i] = 0;
   }
@@ -634,8 +664,10 @@ void dt_gui_cleanup()
   char configfile[512];
   if(snprintf(configfile, sizeof(configfile), "%s/config.rc", dt_pipe.homedir) < 512)
     dt_rc_write(&vkdt.rc, configfile);
+  dt_screencast_cleanup();
   dt_rc_cleanup(&vkdt.rc);
   dt_graph_cleanup(&vkdt.graph_dev);
+  dt_graph_display_images_cleanup(&vkdt.dspy);
 
   dt_gui_win_cleanup(&vkdt.win);
 
@@ -644,21 +676,32 @@ void dt_gui_cleanup()
   threads_mutex_destroy(&vkdt.wstate.notification_mutex);
 }
 
+int
+dt_gui_display_in_use(uint64_t val)
+{
+  for(int k=0;k<DT_GUI_MAX_FRAMES_IN_FLIGHT;k++)
+    if(vkdt.win.display_in_use[k] == val) return 1;
+  for(int k=0;k<DT_GUI_MAX_FRAMES_IN_FLIGHT;k++)
+    if(vkdt.win1.display_in_use[k] == val) return 1;
+  return 0;
+}
+
 static inline VkResult
 dt_gui_win_render(struct nk_context *ctx, dt_gui_win_t *win)
 {
-  VkSemaphore render_complete_semaphore = win->sem_render_complete[win->sem_index];
-  VkSemaphore frame_complete_semaphore  = win->sem_frame_complete [win->sem_index];
-  VkSemaphore image_acquired_semaphore  = win->sem_image_acquired [win->sem_index];
-  QVKR(vkWaitForFences(qvk.device, 1, win->fence+win->sem_fence[win->sem_index], VK_TRUE, UINT64_MAX)); // make sure the semaphore is free
+  const int i = win->frame_index;
+  VkSemaphore frame_semaphore   = win->sem_frame  [i];
+  VkSemaphore acquire_semaphore = win->sem_acquire[i];
+  win->display_in_use[win->frame_index] = vkdt.dspy.timeline_display; // frame in flight will use this display timestamp
+  QVKR(vkWaitForFences(qvk.device, 1, win->fence+i, VK_TRUE, UINT64_MAX));
+  QVKR(vkResetFences  (qvk.device, 1, win->fence+i));
   // timeout is in nanoseconds (these are ~2sec)
-  VkResult res = vkAcquireNextImageKHR(qvk.device, win->swap_chain, 2ul<<30, image_acquired_semaphore, VK_NULL_HANDLE, &win->frame_index);
+  uint32_t image_index;
+  VkResult res = vkAcquireNextImageKHR(qvk.device, win->swap_chain, 2ul<<30, acquire_semaphore, VK_NULL_HANDLE, &image_index);
+  VkSemaphore signal_semaphore  = win->sem_signal[image_index];
   if(!(res == VK_SUCCESS || res == VK_TIMEOUT || res == VK_NOT_READY || res == VK_SUBOPTIMAL_KHR))
     return res;
   
-  const int i = win->frame_index;
-  QVKR(vkWaitForFences(qvk.device, 1, win->fence+i, VK_TRUE, UINT64_MAX));    // wait indefinitely instead of periodically checking
-  QVKR(vkResetFences(qvk.device, 1, win->fence+i));
   QVKR(vkResetCommandPool(qvk.device, win->command_pool[i], 0));
   VkCommandBufferBeginInfo info = {
     .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
@@ -669,105 +712,82 @@ dt_gui_win_render(struct nk_context *ctx, dt_gui_win_t *win)
   VkRenderPassBeginInfo rp_info = {
     .sType                    = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
     .renderPass               = win->render_pass,
-    .framebuffer              = win->framebuffer[i],
+    .framebuffer              = win->framebuffer[image_index],
     .renderArea.extent.width  = win->width,
     .renderArea.extent.height = win->height,
     .clearValueCount          = 1,
     .pClearValues             = &clear_value,
   };
   vkCmdBeginRenderPass(win->command_buffer[i], &rp_info, VK_SUBPASS_CONTENTS_INLINE);
-  win->sem_fence[win->sem_index] = i; // remember which frame in flight uses the semaphores
 
-  nk_glfw3_create_cmd(ctx, win->window, win == &vkdt.win ? &vkdt.global_buf : 0, win->command_buffer[i], NK_ANTI_ALIASING_ON, i, win->num_swap_chain_images);
+  nk_glfw3_create_cmd(ctx, win->window, win == &vkdt.win ? &vkdt.global_buf : 0, win->command_buffer[i], NK_ANTI_ALIASING_ON, i, DT_GUI_MAX_FRAMES_IN_FLIGHT);
 
   // submit command buffer
   vkCmdEndRenderPass(win->command_buffer[i]);
-  const int len = vkdt.graph_res[vkdt.graph_dev.double_buffer] == VK_SUCCESS ? 2 : 1;
   VkPipelineStageFlags wait_stage[] = { 
     VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT|VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
     VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, };
-  if(len > 1) // we are adding one more command list reading the current double buf
-    vkdt.graph_dev.display_dbuffer[vkdt.graph_dev.double_buffer] = MAX(vkdt.graph_dev.display_dbuffer[0], vkdt.graph_dev.display_dbuffer[1]) + 1;
-  uint64_t value_wait  [] = { 0, vkdt.graph_dev.process_dbuffer[vkdt.graph_dev.double_buffer] };
-  uint64_t value_signal[] = { ++win->frame_global, 0, vkdt.graph_dev.display_dbuffer[vkdt.graph_dev.double_buffer] };
+  uint64_t value_wait  [] = { 0, };
+  uint64_t value_signal[] = { ++win->frame_global, 0 };
   VkTimelineSemaphoreSubmitInfo timeline_info = {
     .sType                     = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO,
-    .waitSemaphoreValueCount   = len,
+    .waitSemaphoreValueCount   = 1,
     .pWaitSemaphoreValues      = value_wait,
-    .signalSemaphoreValueCount = len+1,
+    .signalSemaphoreValueCount = 2,
     .pSignalSemaphoreValues    = value_signal,
   };
-  VkSemaphore sem_wait  [] = { image_acquired_semaphore,  vkdt.graph_dev.semaphore_process };
-  VkSemaphore sem_signal[] = { frame_complete_semaphore, render_complete_semaphore, vkdt.graph_dev.semaphore_display };
+  VkSemaphore sem_wait  [] = { acquire_semaphore };
+  VkSemaphore sem_signal[] = { frame_semaphore, signal_semaphore };
   VkSubmitInfo submit = {
     .sType                = VK_STRUCTURE_TYPE_SUBMIT_INFO,
     .pNext                = &timeline_info,
-    .waitSemaphoreCount   = len,
+    .waitSemaphoreCount   = 1,
     .pWaitSemaphores      = sem_wait,
     .pWaitDstStageMask    = wait_stage,
     .commandBufferCount   = 1,
     .pCommandBuffers      = win->command_buffer+i,
-    .signalSemaphoreCount = len+1,
+    .signalSemaphoreCount = 2,
     .pSignalSemaphores    = sem_signal,
   };
 
   QVKR(vkEndCommandBuffer(win->command_buffer[i]));
   QVKLR(&qvk.queue[qvk.qid[s_queue_graphics]].mutex,
       vkQueueSubmit(qvk.queue[qvk.qid[s_queue_graphics]].queue, 1, &submit, win->fence[i]));
-  return VK_SUCCESS;
-}
 
-VkResult dt_gui_render()
-{
-  dt_gui_render_frame_nk(); // potentially set off commands for both ctx/win
-  VkResult r1 = VK_SUCCESS, r0 = VK_SUCCESS;
-  if(vkdt.win1.window) r1 = dt_gui_win_render(&vkdt.ctx1, &vkdt.win1);
-  if(r1 != VK_SUCCESS)
-  {
-    glfwGetFramebufferSize(vkdt.win1.window, &vkdt.win1.width, &vkdt.win1.height);
-    dt_gui_recreate_swapchain(&vkdt.win1);
-    nk_glfw3_resize(vkdt.win1.window, vkdt.win1.width, vkdt.win1.height);
-  }
-  r0 = dt_gui_win_render(&vkdt.ctx, &vkdt.win);
-  if(r0 != VK_SUCCESS)
-  {
-    glfwGetFramebufferSize(vkdt.win.window, &vkdt.win.width, &vkdt.win.height);
-    dt_gui_recreate_swapchain(&vkdt.win);
-    nk_glfw3_resize(vkdt.win.window, vkdt.win.width, vkdt.win.height);
-    dt_gui_init_fonts();
-  }
-  return r1|r0;
-}
-
-static inline VkResult
-dt_gui_present_win(dt_gui_win_t *win)
-{
-  VkSemaphore render_complete_semaphore = win->sem_render_complete[win->sem_index];
-  VkPresentInfoKHR info = {
+  VkPresentInfoKHR pinfo = {
     .sType              = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
     .waitSemaphoreCount = 1,
-    .pWaitSemaphores    = &render_complete_semaphore,
+    .pWaitSemaphores    = &signal_semaphore,
     .swapchainCount     = 1,
     .pSwapchains        = &win->swap_chain,
-    .pImageIndices      = &win->frame_index,
+    .pImageIndices      = &image_index,
   };
-  win->sem_index = (win->sem_index + 1) % win->num_swap_chain_images;
 
   threads_mutex_lock(&qvk.queue[qvk.qid[s_queue_graphics]].mutex);
-  VkResult res = vkQueuePresentKHR(qvk.queue[qvk.qid[s_queue_graphics]].queue, &info);
+  res = vkQueuePresentKHR(qvk.queue[qvk.qid[s_queue_graphics]].queue, &pinfo);
   threads_mutex_unlock(&qvk.queue[qvk.qid[s_queue_graphics]].mutex);
-  if(!(res == VK_SUCCESS || res == VK_SUBOPTIMAL_KHR)) return res;
+  win->frame_index = (win->frame_index + 1)%DT_GUI_MAX_FRAMES_IN_FLIGHT;
+  if(!(res == VK_SUCCESS || res == VK_SUBOPTIMAL_KHR))
+  {
+    glfwGetFramebufferSize(win->window, &win->width, &win->height);
+    dt_gui_recreate_swapchain(win);
+    nk_glfw3_resize(win->window, win->width, win->height);
+    if(win == &vkdt.win) dt_gui_init_fonts();
+    return res;
+  }
   return VK_SUCCESS;
 }
 
-VkResult dt_gui_present()
+void dt_gui_render()
 {
-  VkResult res = 0;
-  if(vkdt.win1.window) res = dt_gui_present_win(&vkdt.win1);
-  return res | dt_gui_present_win(&vkdt.win);
+  dt_graph_display_acquire_for_display(&vkdt.graph_dev); // increment vkdt.dspy.timeline_dspy so dt_image() can pick it up
+  dt_gui_render_frame_nk(); // potentially set off commands for both ctx/win
+  if(vkdt.win1.window)
+    dt_gui_win_render(&vkdt.ctx1, &vkdt.win1);
+  dt_gui_win_render(&vkdt.ctx, &vkdt.win);
 }
 
-static inline void
+void
 dt_gui_rebuild_fav()
 { // rebuild favourites from global list, specific to current graph
   vkdt.fav_cnt = 0;
@@ -1071,7 +1091,7 @@ void dt_gui_win1_open()
   nk_style_from_table(&vkdt.ctx1, vkdt.style.colour);
   nk_style_set_font(&vkdt.ctx1, nk_glfw3_font(0));
   nk_glfw3_win1_open(&vkdt.ctx1, vkdt.win1.render_pass, vkdt.win1.window, 
-      vkdt.win1.num_swap_chain_images * 2560*1024,
-      vkdt.win1.num_swap_chain_images * 640*1024);
+      DT_GUI_MAX_FRAMES_IN_FLIGHT * 2560*1024,
+      DT_GUI_MAX_FRAMES_IN_FLIGHT * 640*1024);
   // XXX TODO glfw callbacks for resize, close, maybe some buttons for fullscreen/close
 }

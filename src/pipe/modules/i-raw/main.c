@@ -150,7 +150,7 @@ void modify_roi_out(
     mod->flags = s_module_request_read_source;
   }
   
-  if(load_raw(mod, id + graph->frame, filename)) return;
+  if(load_raw(mod, id + graph->frame, fname)) return;
   rawinput_buf_t *mod_data = (rawinput_buf_t *)mod->data;
   // we know we only have one connector called "output" (see our "connectors" file)
   mod->connector[0].roi.full_wd = mod_data->img.width;
@@ -217,12 +217,18 @@ void modify_roi_out(
   mod->img_param.whitebalance[3] /= mod->img_param.whitebalance[1];
   mod->img_param.whitebalance[1] = 1.0f;
   mod->img_param.filters = mod_data->img.filters;
-
-  if(mod_data->img.cpp == 3)
+  
+  if(!mod_data->img.filters && mod_data->img.cpp == 1)
+  {
+    mod->connector[0].chan = dt_token("r");
+    mod->img_param.filters = 0;
+  }
+  else if(mod_data->img.cpp == 3)
   {
     mod->connector[0].chan = dt_token("rgba");
     mod->img_param.filters = 0;
   }
+  else mod->connector[0].chan = dt_token("rggb");
 
   float xyz_to_cam[12], mat[9] = {0};
   // get d65 camera matrix from rawloader
@@ -255,6 +261,11 @@ void modify_roi_out(
   mat3mul(cam_to_rec2020, xyz_to_rec2020, cam_to_xyz);
   for(int k=0;k<9;k++)
     mod->img_param.cam_to_rec2020[k] = cam_to_rec2020[k];
+  if(!mod_data->img.filters && mod_data->img.cpp == 1)
+  { // fake greyscale matrix:
+    float grey_to_rec2020[] = { 1, 0, 0, 1, 0, 0, 1, 0, 0 };
+    memcpy(mod->img_param.cam_to_rec2020, grey_to_rec2020, sizeof(float)*9);
+  }
 }
 
 int read_source(
@@ -264,10 +275,7 @@ int read_source(
 {
   const int   id    = dt_module_param_int(mod, 3)[0];
   const char *fname = dt_module_param_string(mod, 0);
-  char        filename[2*PATH_MAX+10];
-  if(dt_graph_get_resource_filename(mod, fname, id + mod->graph->frame, filename, sizeof(filename)))
-    return 1;
-  int err = load_raw(mod, id + mod->graph->frame, filename);
+  int err = load_raw(mod, id + mod->graph->frame, fname);
   if(err) return 1;
   // TODO: if img.data_type == 1 it's an f32 buffer instead.
   uint16_t *buf = (uint16_t *)mapped;
@@ -291,7 +299,7 @@ int read_source(
     {
       for(int k=0;k<3;k++)
         buf[4*(j*wd + i)+k] = ((uint16_t*)mod_data->img.data)[(j+oy)*stride + icpp*(ox + i) + k];
-      buf[4*(j*wd + i)+3] = 1.0;
+      buf[4*(j*wd + i)+3] = 0xffff;
     }
   }
   return 0;

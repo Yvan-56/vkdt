@@ -43,8 +43,6 @@ widget_end()
   if(!vkdt.wstate.grabbed)
   {
     if(vkdt.wstate.active_widget_modid < 0) return; // all good already
-    // rerun all (roi could have changed, buttons are drastic)
-    vkdt.graph_dev.runflags = s_graph_run_all;
     int modid = vkdt.wstate.active_widget_modid;
     int parid = vkdt.wstate.active_widget_parid;
     int parnm = vkdt.wstate.active_widget_parnm;
@@ -140,6 +138,23 @@ static inline void render_perf_overlay()
   values_offset = (values_offset + 1) & nvmask;
 }
 
+static inline int
+dt_gui_widget_is_visible(int modid, int parid)
+{
+  const dt_ui_param_t *param = vkdt.graph_dev.module[modid].so->param[parid];
+  if(!param) return 0;
+  if(param->widget.tabid >= 0)
+  { // are we in the currently visible tab?
+    int tab = dt_module_param_int(vkdt.graph_dev.module + modid, param->widget.tabid)[0];
+    if(param->widget.tab != tab) return 0;
+  }
+  if(param->widget.grpid == -1) return 1;
+  int grpval = dt_module_param_int(vkdt.graph_dev.module + modid, param->widget.grpid)[0];
+  if(param->widget.grp <  100 && grpval != param->widget.grp) return 0;
+  if(param->widget.grp >= 100 && grpval == param->widget.grp - 100) return 0;
+  return dt_gui_widget_is_visible(modid, param->widget.grpid);
+}
+
 static inline void
 render_darkroom_widget(int modid, int parid, int is_fav_menu)
 {
@@ -147,14 +162,8 @@ render_darkroom_widget(int modid, int parid, int is_fav_menu)
   if(!param) return;
   struct nk_context *ctx = &vkdt.ctx;
 
-  // skip if group mode does not match:
-  if(param->widget.grpid != -1)
-  {
-    if(param->widget.mode <  100 && dt_module_param_int(vkdt.graph_dev.module + modid, param->widget.grpid)[0] != param->widget.mode)
-      return;
-    if(param->widget.mode >= 100 && dt_module_param_int(vkdt.graph_dev.module + modid, param->widget.grpid)[0] == param->widget.mode-100)
-      return;
-  }
+  // skip if group or any parent group mode does not match:
+  if(!dt_gui_widget_is_visible(modid, parid)) return;
 
 #define CONTEXTMENU(rect) \
   { struct nk_vec2 cm_sz_ = {(rect).w, (rect).w};\
@@ -573,7 +582,7 @@ render_darkroom_widget(int modid, int parid, int is_fav_menu)
         float dx = ctx->input.mouse.pos.x - ctx->input.mouse.prev.x;
         float dy = ctx->input.mouse.pos.y - ctx->input.mouse.prev.y;
         int shift = nk_input_is_key_down(&ctx->input, NK_KEY_SHIFT);
-        float sens = shift ? 0.15f : 0.005f;
+        float sens = 0.15f * (shift ? NK_PROPERTY_FINE_SCALE : 1.0f);
         float sx = dx / (radius * 2.0f) * sens;
         float sy = dy / (radius * 2.0f) * sens;
         // constrained so sum of R+G+B deltas stays 0 (chromaticity only)
@@ -624,7 +633,7 @@ render_darkroom_widget(int modid, int parid, int is_fav_menu)
           float mo  = val[3];
           float dx  = ctx->input.mouse.pos.x - ctx->input.mouse.prev.x;
           int shift = nk_input_is_key_down(&ctx->input, NK_KEY_SHIFT);
-          float sens = m_rng * (shift ? 0.002f : 0.0002f);
+          float sens = m_rng * 0.0002f * (shift ? NK_PROPERTY_FINE_SCALE : 1.0f);
           val[3] = CLAMP(val[3] + dx * sens, m_min, m_max);
           if(val[3] != mo) change = 1;
         }
@@ -760,7 +769,7 @@ render_darkroom_widget(int modid, int parid, int is_fav_menu)
       if(nk_button_label(ctx, str))
       {
         dt_module_t *m = vkdt.graph_dev.module+modid;
-        if(m->so->ui_callback) m->so->ui_callback(m, param->name);
+        if(m->so->ui_callback) m->so->ui_callback(m, param->name, 0.0f);
         vkdt.graph_dev.runflags |= s_graph_run_record_cmd_buf;
         vkdt.graph_dev.active_module = modid;
         dt_graph_history_append(&vkdt.graph_dev, modid, parid, throttle);
@@ -800,6 +809,66 @@ render_darkroom_widget(int modid, int parid, int is_fav_menu)
       dt_tooltip(param->tooltip);
       KEYFRAME
       nk_label(ctx, str, NK_TEXT_LEFT);
+    }
+  }
+  else if(param->widget.type == dt_token("tabs"))
+  { // tab header
+    if(param->type == dt_token("int"))
+    {
+      int32_t *val = (int32_t*)(vkdt.graph_dev.module[modid].param + param->offset) + num;
+      int32_t oldval = *val;
+      RESETBLOCK
+
+      float bw = 0.333f*wds[0]-2.0f/3.0f*ctx->style.window.spacing.x;
+      float r4[] = {bw, bw, bw, wds[1]}; // good idea to align with the rest but make last one different size?
+      nk_layout_row(ctx, NK_STATIC, row_height, 4, r4);
+      const char *c = (const char *)param->widget.data;
+      int rowidx = 0;
+      int rw = 4; // fixed number per row for now
+      int idx = 0;
+      while(1)
+      {
+        if(c[0])
+        {
+          const int sel = *val == idx;
+          if(sel)
+          {
+            nk_style_push_style_item(ctx, &ctx->style.button.normal, nk_style_item_color(vkdt.style.colour[NK_COLOR_BUTTON_ACTIVE]));
+            nk_style_push_color(ctx, &ctx->style.button.text_normal, vkdt.style.colour[NK_COLOR_DT_ACCENT_TEXT_ACTIVE]);
+          }
+          dt_tooltip(param->tooltip);
+          if(nk_button_label(ctx, c))
+          {
+            *val = idx;
+            change = 1;
+          }
+          if(sel)
+          {
+            nk_style_pop_style_item(ctx);
+            nk_style_pop_color(ctx);
+          }
+          idx++;
+          rowidx++;
+        }
+        if(!c[0] || (rowidx % rw) == 0)
+        { // second null byte found or row complete
+          rowidx = 0;
+          if(!c[0]) break;
+        }
+        while(*c) c++;
+        c++; // skip null byte
+      }
+
+      if(change)
+      {
+        dt_graph_run_t flags = s_graph_run_none;
+        if(vkdt.graph_dev.module[modid].so->check_params)
+          flags = vkdt.graph_dev.module[modid].so->check_params(vkdt.graph_dev.module+modid, parid, num, &oldval);
+        vkdt.graph_dev.runflags |= flags | s_graph_run_record_cmd_buf;
+        vkdt.graph_dev.active_module = modid;
+        dt_graph_history_append(&vkdt.graph_dev, modid, parid, throttle);
+        vkdt.wstate.busy += 2;
+      }
     }
   }
   else if(param->widget.type == dt_token("btngrid"))
@@ -911,6 +980,7 @@ render_darkroom_widget(int modid, int parid, int is_fav_menu)
         dt_module_set_param_float(vkdt.graph_dev.module+modid, dt_token("rotate"), vkdt.wstate.state[9]);
         dt_module_set_param_float_n(vkdt.graph_dev.module+modid, dt_token("crop"), vkdt.wstate.state+10, 4);
         widget_end();
+        vkdt.graph_dev.runflags = s_graph_run_all;
         dt_graph_history_append(&vkdt.graph_dev, modid, parid, throttle);
       }
       nk_style_pop_style_item(ctx);
@@ -929,8 +999,9 @@ render_darkroom_widget(int modid, int parid, int is_fav_menu)
         vkdt.wstate.active_widget_parid = parid;
         vkdt.wstate.active_widget_parnm = 0;
         vkdt.wstate.active_widget_parsz = dt_ui_param_size(param->type, param->cnt);
-        // copy to quad state
+        // copy to quad state, and keep the original for escape
         memcpy(vkdt.wstate.state, v, sizeof(float)*8);
+        memcpy(vkdt.wstate.state+14, v, sizeof(float)*8);
         float rot = dt_module_param_float(vkdt.graph_dev.module+modid, dt_module_get_param(vkdt.graph_dev.module[modid].so, dt_token("rotate")))[0];
         dt_module_set_param_float(vkdt.graph_dev.module+modid, dt_token("rotate"), 0.0f);
         vkdt.wstate.state[9] = rot;
@@ -1021,10 +1092,8 @@ render_darkroom_widget(int modid, int parid, int is_fav_menu)
     float *v = (float*)(vkdt.graph_dev.module[modid].param + param->offset);
     const float iwd = vkdt.graph_dev.module[modid].connector[0].roi.wd;
     const float iht = vkdt.graph_dev.module[modid].connector[0].roi.ht;
-    const float aspect = iwd/iht;
     const float rot = dt_module_param_float(vkdt.graph_dev.module+modid, dt_module_get_param(vkdt.graph_dev.module[modid].so, dt_token("rotate")))[0];
     const int portrait = (fabsf(rot-90) < 45 || fabsf(rot-270) < 45);
-    static int portrait_on_activate;
     if(vkdt.wstate.active_widget_modid == modid && vkdt.wstate.active_widget_parid == parid)
     {
       int accept = 0;
@@ -1033,14 +1102,16 @@ render_darkroom_widget(int modid, int parid, int is_fav_menu)
       nk_style_push_color(ctx, &ctx->style.button.text_normal, vkdt.style.colour[NK_COLOR_DT_ACCENT_TEXT]);
       if(nk_button_label(ctx, string) || accept)
       {
-        if(portrait_on_activate)
+        if(vkdt.wstate.portrait)
         {
-          vkdt.wstate.state[0] = .5f + MIN(1.0f, 1.0f/aspect) * (vkdt.wstate.state[0] - .5f);
-          vkdt.wstate.state[1] = .5f + MIN(1.0f, 1.0f/aspect) * (vkdt.wstate.state[1] - .5f);
-          vkdt.wstate.state[2] = .5f + MAX(1.0f,      aspect) * (vkdt.wstate.state[2] - .5f);
-          vkdt.wstate.state[3] = .5f + MAX(1.0f,      aspect) * (vkdt.wstate.state[3] - .5f);
+          const float sx = iht/iwd, sy = iwd/iht;
+          vkdt.wstate.state[0] = .5f + sx * (vkdt.wstate.state[0] - .5f);
+          vkdt.wstate.state[1] = .5f + sx * (vkdt.wstate.state[1] - .5f);
+          vkdt.wstate.state[2] = .5f + sy * (vkdt.wstate.state[2] - .5f);
+          vkdt.wstate.state[3] = .5f + sy * (vkdt.wstate.state[3] - .5f);
         }
         widget_end();
+        vkdt.graph_dev.runflags = s_graph_run_all;
         dt_image_reset_zoom(&vkdt.wstate.img_widget);
         dt_graph_history_append(&vkdt.graph_dev, modid, parid, throttle);
       }
@@ -1071,13 +1142,14 @@ render_darkroom_widget(int modid, int parid, int is_fav_menu)
         const float oht = portrait ? iwd : iht;
         // reset module params so the image will not appear cropped:
         float def[] = {0,1,0,1};
+        vkdt.wstate.portrait = portrait;
         if(portrait)
         {
-          portrait_on_activate = portrait;
-          def[0] = .5f + MIN(1.0f, 1.0f/aspect) * (0.0f - .5f);
-          def[1] = .5f + MIN(1.0f, 1.0f/aspect) * (1.0f - .5f);
-          def[2] = .5f + MAX(1.0f,      aspect) * (0.0f - .5f);
-          def[3] = .5f + MAX(1.0f,      aspect) * (1.0f - .5f);
+          const float sx = iht/iwd, sy = iwd/iht;
+          def[0] = .5f - .5f*sx;
+          def[1] = .5f + .5f*sx;
+          def[2] = .5f - .5f*sy;
+          def[3] = .5f + .5f*sy;
         }
         float *c = vkdt.wstate.state;
         if(c[0] == 1.0 && c[1] == 3.0 && c[2] == 3.0 && c[3] == 7.0)
@@ -1093,7 +1165,9 @@ render_darkroom_widget(int modid, int parid, int is_fav_menu)
         w->scale = 0.9;
       }
     }
-    nk_tab_property(float, ctx, "#aspect", 0.0, &vkdt.wstate.aspect, 10.0, 0.1, .001);
+    dt_tooltip("aspect ratio (width/height) of the crop.\n0 is free, -1 keeps the aspect ratio of the original image");
+    nk_tab_property(float, ctx, "#aspect", -1.0, &vkdt.wstate.aspect, 10.0, 0.1, .001);
+    if(vkdt.wstate.aspect < 0.0f) vkdt.wstate.aspect = -1.0f;
     RESETBLOCK
     if(change)
     {
@@ -1104,13 +1178,35 @@ render_darkroom_widget(int modid, int parid, int is_fav_menu)
     dt_module_t *m = vkdt.graph_dev.module+modid;
     if(m->so->ui_callback)
     {
-      dt_tooltip("automatically crop away black rims");
+      dt_tooltip("automatically crop away black rims,\nas large as the aspect ratio setting allows");
       if(nk_button_label(ctx, "auto crop"))
       {
-        m->so->ui_callback(m, param->name);
-        dt_image_reset_zoom(&vkdt.wstate.img_widget);
-        vkdt.graph_dev.runflags = s_graph_run_all;
-        dt_graph_history_append(&vkdt.graph_dev, modid, parid, throttle);
+        float ar = vkdt.wstate.aspect;
+        if(ar < 0.0f) ar = portrait ? iht/iwd : iwd/iht;
+        if(vkdt.wstate.active_widget_modid == modid && vkdt.wstate.active_widget_parid == parid)
+        {
+          const float sx = portrait ? iht/iwd : 1.0f;
+          const float sy = portrait ? iwd/iht : 1.0f;
+          float save[4];
+          memcpy(save, v, sizeof(save));
+          v[0] = .5f + sx * (vkdt.wstate.state[0] - .5f);
+          v[1] = .5f + sx * (vkdt.wstate.state[1] - .5f);
+          v[2] = .5f + sy * (vkdt.wstate.state[2] - .5f);
+          v[3] = .5f + sy * (vkdt.wstate.state[3] - .5f);
+          m->so->ui_callback(m, param->name, ar);
+          vkdt.wstate.state[0] = .5f + (v[0] - .5f)/sx;
+          vkdt.wstate.state[1] = .5f + (v[1] - .5f)/sx;
+          vkdt.wstate.state[2] = .5f + (v[2] - .5f)/sy;
+          vkdt.wstate.state[3] = .5f + (v[3] - .5f)/sy;
+          memcpy(v, save, sizeof(save));
+        }
+        else
+        {
+          m->so->ui_callback(m, param->name, ar);
+          dt_image_reset_zoom(&vkdt.wstate.img_widget);
+          vkdt.graph_dev.runflags = s_graph_run_all;
+          dt_graph_history_append(&vkdt.graph_dev, modid, parid, throttle);
+        }
       }
     }
     else
@@ -1136,6 +1232,7 @@ render_darkroom_widget(int modid, int parid, int is_fav_menu)
       if(nk_button_label(ctx, string))
       {
         widget_end();
+        vkdt.graph_dev.runflags |= s_graph_run_record_cmd_buf;
         dt_graph_history_append(&vkdt.graph_dev, modid, parid, throttle);
       }
       nk_style_pop_style_item(ctx);
@@ -1326,6 +1423,58 @@ render_darkroom_widget(int modid, int parid, int is_fav_menu)
       }
     }
   }
+  else if(param->widget.type == dt_token("click"))
+  { // clicks on the image, stored as count followed by x y label, and an optional box
+    const float w3[] = {0.35f*pwd-ctx->style.window.spacing.x, 0.35f*pwd-ctx->style.window.spacing.x, wds[1]};
+    nk_layout_row(ctx, NK_STATIC, row_height, 3, w3);
+    float *v = (float*)(vkdt.graph_dev.module[modid].param + param->offset);
+    const int bid = dt_module_get_param(vkdt.graph_dev.module[modid].so, dt_token("box"));
+    float *b = (float *)dt_module_param_float(vkdt.graph_dev.module+modid, bid);
+    if(vkdt.wstate.active_widget_modid == modid && vkdt.wstate.active_widget_parid == parid)
+    {
+      nk_style_push_style_item(ctx, &ctx->style.button.normal, nk_style_item_color(vkdt.style.colour[NK_COLOR_DT_ACCENT]));
+      nk_style_push_color(ctx, &ctx->style.button.text_normal, vkdt.style.colour[NK_COLOR_DT_ACCENT_TEXT]);
+      if(nk_button_label(ctx, "done"))
+      {
+        widget_end();
+        dt_graph_history_append(&vkdt.graph_dev, modid, parid, throttle);
+        if(b) dt_graph_history_append(&vkdt.graph_dev, modid, bid, throttle);
+      }
+      nk_style_pop_style_item(ctx);
+      nk_style_pop_color(ctx);
+    }
+    else
+    {
+      dt_tooltip("left click on the image to add to the selection\n"
+          "right click to remove from it\n"
+          "left drag to select within a box");
+      if(nk_button_label(ctx, "select"))
+      {
+        widget_end(); // if another one is still in progress, end that now
+        vkdt.wstate.active_widget_modid = modid;
+        vkdt.wstate.active_widget_parid = parid;
+        vkdt.wstate.active_widget_parnm = 0;
+        vkdt.wstate.active_widget_parsz = dt_ui_param_size(param->type, param->cnt);
+        vkdt.wstate.mapped_size = dt_ui_param_size(param->type, param->cnt);
+        vkdt.wstate.mapped = v;
+      }
+    }
+    if(nk_button_label(ctx, "clear"))
+    {
+      const int did = dt_module_get_param(vkdt.graph_dev.module[modid].so, dt_token("draw"));
+      int32_t *d = (int32_t *)dt_module_param_int(vkdt.graph_dev.module+modid, did);
+      v[0] = 0.0f;
+      if(b) b[0] = b[1] = b[2] = b[3] = -1.0f;
+      if(d) d[0] = 0;
+      vkdt.graph_dev.runflags = s_graph_run_all; // the module may run a different number of passes
+      dt_graph_history_append(&vkdt.graph_dev, modid, parid, throttle);
+      if(b) dt_graph_history_append(&vkdt.graph_dev, modid, bid, throttle);
+      if(d) dt_graph_history_append(&vkdt.graph_dev, modid, did, throttle);
+    }
+    dt_tooltip(param->tooltip);
+    nk_labelf(ctx, NK_TEXT_LEFT, "%d clicks", (int)v[0]);
+    num = count;
+  }
   else if(param->widget.type == dt_token("draw"))
   {
     nk_layout_row(ctx, NK_STATIC, row_height, 2, wds);
@@ -1376,9 +1525,10 @@ render_darkroom_widget(int modid, int parid, int is_fav_menu)
         vkdt.wstate.mapped = v; // map state
       }
     }
-    if(vkdt.wstate.mapped)
+    if(vkdt.wstate.mapped && vkdt.wstate.active_widget_modid == modid && vkdt.wstate.active_widget_parid == parid)
     {
-      nk_labelf(ctx, NK_TEXT_LEFT, "%d/10000 verts", ((uint32_t *)vkdt.wstate.mapped)[0]);
+      nk_labelf(ctx, NK_TEXT_LEFT, "%d/%d verts", ((uint32_t *)vkdt.wstate.mapped)[0],
+          (int)(vkdt.wstate.mapped_size/sizeof(uint32_t) - 2)/2);
     }
     num = count;
   }
@@ -1597,33 +1747,18 @@ static inline void render_darkroom_widgets(
   }
   if(active)
   {
-    const int display_frame = vkdt.graph_dev.double_buffer % 2;
     if(graph->active_module == curr &&
         dt_module_get_connector(arr+curr, dt_token("dspy")) >= 0)
     {
       dt_node_t *out_dspy = dt_graph_get_display(graph, dt_token("dspy"));
-      if(out_dspy && vkdt.graph_res[display_frame] == VK_SUCCESS)
+      if(out_dspy)
       {
-        struct nk_rect row = nk_layout_widget_bounds(ctx);
-        float iwd = out_dspy->connector[0].roi.wd;
-        float iht = out_dspy->connector[0].roi.ht;
-        float scale = MIN(
-            MIN(out_dspy->connector[0].roi.wd, row.w) / iwd,
-            MIN(out_dspy->connector[0].roi.ht, row.w) / iht);
-        int ht = scale * iht, wd = scale * iwd;
-        float r = wd / (float)row.w;
-        nk_style_push_vec2(ctx, &ctx->style.window.spacing, nk_vec2(0,ctx->style.window.spacing.y));
-        float w3[] = {
-          0.5*(1-r)*pwd-ctx->style.window.spacing.x,
-          r*pwd-ctx->style.window.spacing.x,
-          0.5*(1-r)*pwd};
-        nk_layout_row(ctx, NK_STATIC, ht, 3, w3);
-        nk_label(ctx, "", 0);
+        dt_image_widget_t imgw = { .look_at_x = 0, .look_at_y = 0, .scale=1.0 };
+        int wd = vkdt.state.panel_wd;
+        int ht = wd * out_dspy->connector[0].roi.full_ht / (float)out_dspy->connector[0].roi.full_wd; // image aspect
+        nk_layout_row_dynamic(ctx, ht, 1);
         vkdt.wstate.active_dspy_bound = nk_widget_bounds(ctx);
-        struct nk_image img = nk_image_ptr(out_dspy->dset[display_frame]);
-        nk_image(ctx, img);
-        nk_label(ctx, "", 0);
-        nk_style_pop_vec2(ctx);
+        dt_image(ctx, &imgw, out_dspy, 0, 0, 0);
       }
     }
     for(int i=0;i<arr[curr].so->num_params;i++)
@@ -1924,6 +2059,30 @@ dt_gui_darkroom_dspy_mouse_button(GLFWwindow* window, int button, int action, in
         .x = (x-b.x)/b.w,
         .y = 1.0-(y-b.y)/b.h,
         .mbutton = button,
+        .action  = action,
+        .mods    = mods,
+        .grabbed = vkdt.wstate.grabbed,
+      };
+      if(mod->so->input)
+        vkdt.graph_dev.runflags |= mod->so->input(mod, &p);
+    }
+  }
+}
+
+static inline void
+dt_gui_darkroom_dspy_keyboard(GLFWwindow* window, int key, int action, int mods)
+{
+  double x, y;
+  dt_view_get_cursor_pos(vkdt.win.window, &x, &y);
+  if(!vkdt.wstate.grabbed && (vkdt.graph_dev.active_module >= 0))
+  { // pass on mouse events on dspy window
+    dt_module_t *mod = vkdt.graph_dev.module + vkdt.graph_dev.active_module;
+    struct nk_rect b = vkdt.wstate.active_dspy_bound;
+    if(NK_INBOX(x,y,b.x,b.y,b.w,b.h))
+    {
+      dt_module_input_event_t p = {
+        .type = 4,
+        .key     = key,
         .action  = action,
         .mods    = mods,
         .grabbed = vkdt.wstate.grabbed,

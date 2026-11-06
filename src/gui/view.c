@@ -65,6 +65,7 @@ dt_view_switch(dt_gui_view_t view)
 void
 dt_view_mouse_button(GLFWwindow *window, int button, int action, int mods)
 {
+  dt_screencast_event(s_screencast_mouse, button, action, mods);
   if(vkdt.wstate.popup) return;
   switch(vkdt.view_mode)
   {
@@ -138,6 +139,7 @@ dt_view_char(GLFWwindow *window, unsigned int c)
 void
 dt_view_keyboard(GLFWwindow *window, int key, int scancode, int action, int mods)
 {
+  dt_screencast_event(s_screencast_keyboard, key, action, mods);
   if(dt_actionkey_keyboard(&actionkeys, key, action)) return;
   switch(vkdt.view_mode)
   {
@@ -199,6 +201,8 @@ dt_view_gamepad(GLFWwindow *window, GLFWgamepadstate *last, GLFWgamepadstate *cu
 #define PRESSED(A) curr->buttons[A] && !last->buttons[A]
   if(PRESSED(GLFW_GAMEPAD_BUTTON_GUIDE))
     vkdt.wstate.show_gamepadhelp ^= 1;
+  for(int i=0;i<LENGTH(curr->buttons);i++)
+    if(PRESSED(i)) dt_screencast_event(s_screencast_gamepad, i, GLFW_PRESS, 0);
 #undef PRESSED
 
   switch(vkdt.view_mode)
@@ -235,4 +239,11 @@ void dt_view_get_cursor_pos(GLFWwindow *window, double *x, double *y)
   dt_gui_content_scale(window, &xscale, &yscale);
   *x *= xscale;
   *y *= yscale;
+}
+
+uint32_t dt_view_snd_process(uint8_t **buf, uint32_t size)
+{
+  if(vkdt.view_mode == s_view_darkroom)
+    return darkroom_snd_process(buf, size);
+  return 0;
 }

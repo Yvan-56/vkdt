@@ -51,25 +51,16 @@ void render_nodes_right_panel()
     NK_UPDATE_ACTIVE;
     nk_end(ctx);
   }
-  const int display_frame = vkdt.graph_dev.double_buffer % 2;
-  dt_node_t *out_hist = dt_graph_get_display(&vkdt.graph_dev, dt_token("hist"));
-  if(out_hist && vkdt.graph_res[display_frame] == VK_SUCCESS && out_hist->dset[display_frame])
-  {
-    int wd = vkdt.state.panel_wd;
-    int ht = wd * out_hist->connector[0].roi.full_ht / (float)out_hist->connector[0].roi.full_wd; // image aspect
-    nk_layout_row_dynamic(&vkdt.ctx, ht, 1);
-    struct nk_image img = nk_image_ptr(out_hist->dset[display_frame]);
-    nk_image(ctx, img);
-  }
   static dt_image_widget_t imgw[] = {
     { .look_at_x = 0, .look_at_y = 0, .scale=1.0 },
     { .look_at_x = 0, .look_at_y = 0, .scale=1.0 },
+    { .look_at_x = 0, .look_at_y = 0, .scale=1.0 },
     { .look_at_x = 0, .look_at_y = 0, .scale=1.0 }};
-  dt_token_t dsp[] = { dt_token("main"), dt_token("view0"), dt_token("view1") };
+  dt_token_t dsp[] = { dt_token("hist"), dt_token("main"), dt_token("view0"), dt_token("view1") };
   for(uint32_t d = 0; d < sizeof(dsp)/sizeof(dsp[0]); d++)
   {
     dt_node_t *out = dt_graph_get_display(&vkdt.graph_dev, dsp[d]);
-    if(out && vkdt.graph_res[display_frame] == VK_SUCCESS)
+    if(out)
     {
       const int popout = (dsp[d] == dt_token("main")) && vkdt.win1.window;
       char title[20] = {0};
@@ -91,9 +82,9 @@ void render_nodes_right_panel()
         int ht = wd * out->connector[0].roi.full_ht / (float)out->connector[0].roi.full_wd; // image aspect
         nk_layout_row_dynamic(ctx, ht, 1);
         if(dsp[d] == dt_token("main"))
-          dt_image(ctx, &vkdt.wstate.img_widget, out, 1, popout ? 0 : 1);
+          dt_image(ctx, &vkdt.wstate.img_widget, out, 1, popout ? 0 : 1, 0);
         else
-          dt_image(ctx, imgw+d, out, 1, 0);
+          dt_image(ctx, imgw+d, out, 1, 0, 0);
       }
       if(popout)
       {
@@ -165,8 +156,12 @@ void render_nodes()
   render_darkroom_modals(); // comes first so we can add a module popup from the context menu
   if(num_modules < vkdt.graph_dev.num_modules)
   { // module has been added, move and select it. does not work if a module reclaims the slot of a previously deleted one. do we care?
-    vkdt.graph_dev.module[num_modules].gui_x = nodes.nedit.add_pos_x;
-    vkdt.graph_dev.module[num_modules].gui_y = nodes.nedit.add_pos_y;
+    if(vkdt.graph_dev.module[num_modules].gui_x == 0 &&
+       vkdt.graph_dev.module[num_modules].gui_y == 0)
+    { // a preset might have added modules at specific position
+      vkdt.graph_dev.module[num_modules].gui_x = nodes.nedit.add_pos_x;
+      vkdt.graph_dev.module[num_modules].gui_y = nodes.nedit.add_pos_y;
+    }
     dt_node_editor_clear_selection(&nodes.nedit);
     dt_node_editor_select(&nodes.nedit, &vkdt.graph_dev, num_modules);
   }
@@ -236,7 +231,7 @@ void render_nodes()
       if(graph->module[mod_id[m]].gui_x == 0 && graph->module[mod_id[m]].gui_y == 0)
       {
         graph->module[mod_id[m]].gui_x = nodew*(m+0.25-pos);
-        graph->module[mod_id[m]].gui_x = 2*nodey;
+        graph->module[mod_id[m]].gui_y = 2*nodey;
       }
     }
   }

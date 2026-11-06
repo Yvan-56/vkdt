@@ -7,6 +7,7 @@
 
 // create nodes requires roi requires alloc requires upload source
 typedef uint32_t dt_graph_run_t;
+typedef struct dt_graph_display_images_t dt_graph_display_images_t;
 
 typedef struct dt_connector_image_t
 {
@@ -35,6 +36,29 @@ typedef struct dt_graph_query_t
   float        last_frame_duration; // for convenience the last frame time in milliseconds
 }
 dt_graph_query_t;
+
+typedef struct dt_graph_memory_t
+{
+  dt_vkalloc_t    heap;
+  VkDeviceMemory  vkmem;
+  VkDeviceSize    vkmem_size;
+  uint32_t        memory_type;
+  uint8_t         persistent;
+  uint8_t         low_32bit_offsets;
+}
+dt_graph_memory_t;
+
+typedef struct dt_graph_memory_request_t
+{
+  VkMemoryPropertyFlags required_flags;
+  VkMemoryPropertyFlags preferred_flags;
+  VkMemoryPropertyFlags avoid_flags;
+  uint8_t               persistent;
+  uint8_t               low_32bit_offsets;
+}
+dt_graph_memory_request_t;
+
+#define DT_GRAPH_MAX_MEMORY_ARENAS (VK_MAX_MEMORY_TYPES * 5)
 
 // the graph is stored as list of modules and list of nodes.
 // these have connectors with detailed buffer information which
@@ -68,17 +92,9 @@ typedef struct dt_graph_t
   dt_connector_image_t *conn_image_pool;
   uint32_t              conn_image_end, conn_image_max;
 
-  dt_vkalloc_t          heap;           // allocator for device images
-  dt_vkalloc_t          heap_1;         // overflow allocator for >4G storage images
-  dt_vkalloc_t          heap_staging;   // used for staging memory, which has different flags
-  dt_vkalloc_t          heap_protected; // protected memory is never freed so it has its own heap
-
-  uint32_t              memory_type_bits;
-  uint32_t              memory_type_bits_staging;
-  VkDeviceMemory        vkmem;
-  VkDeviceMemory        vkmem_1;
-  VkDeviceMemory        vkmem_staging;
-  VkDeviceMemory        vkmem_protected;
+  // Arenas are created lazily for the actual Vulkan memory type requested by a resource.
+  dt_graph_memory_t     memory[DT_GRAPH_MAX_MEMORY_ARENAS];
+  uint32_t              memory_cnt;
 
   VkPipeline                  mipmap_pipeline;
   VkPipelineLayout            mipmap_pipeline_layout;
@@ -95,11 +111,16 @@ typedef struct dt_graph_t
   VkCommandBuffer       command_buffer_gfx[2]; // graphics-queue fallback when s_node_graphics nodes are present
   VkCommandPool         command_pool_gfx;
   int                   use_graphics_queue;    // set each run: 1 when s_node_graphics nodes exist and a separate compute family is in use
-  VkSemaphore           semaphore_display;   // timeline semaphore to keep track of commands that use the backbuffer images
-  uint64_t              display_dbuffer[2];  // indicate the largest display timeline position currently reading double buffer 0 or 1
   VkSemaphore           semaphore_process;   // timeline semaphore indicating that graph processing/double buffer write access is done
-  uint64_t              process_dbuffer[2];  // timestamps indicating that processing will be done for double buffer 0 or 1
+  VkSemaphore           semaphore_extra;     // external sync (wait for video decoder)
+  uint64_t              semaphore_extra_val; // value to wait for
   qvk_queue_name_t      queue_name;
+  dt_graph_display_images_t *dspy;           // used for ui synchronisation, if set. owned by the ui.
+  uint64_t (*dspy_acquire)(dt_graph_t *g);   // callback to get new frame id/semaphore value
+  uint64_t              timeline_value;      // value of last submitted timeval semaphore (have to wait for this to finish before cleanup)
+  VkCommandBuffer       tmp_cmd;             // "temporary" command buffer for occasional cpu synced buffer uploads
+  VkCommandPool         tmp_cmd_pool;
+  VkSemaphore           tmp_sem;
 
   VkBuffer              uniform_buffer;      // uniform buffer shared between all nodes
   VkDeviceMemory        vkmem_uniform;
@@ -109,11 +130,8 @@ typedef struct dt_graph_t
 
   dt_raytrace_graph_t   rt;
 
-  VkDeviceSize          vkmem_size;          // allocation sizes to tell whether we need to re-alloc
-  VkDeviceSize          vkmem_1_size;
-  VkDeviceSize          vkmem_staging_size;
+  // allocation sizes to tell whether we need to re-alloc
   VkDeviceSize          vkmem_uniform_size;
-  VkDeviceSize          vkmem_protected_size;
 
   dt_graph_query_t      query[2];            // for odd and even command buffers, starting at half query_max
 
@@ -172,8 +190,8 @@ dt_graph_cmd_buf(const dt_graph_t *g)
     ? g->command_buffer_gfx[g->double_buffer]
     : g->command_buffer    [g->double_buffer];
 }
-void dt_graph_cleanup(dt_graph_t *g);                      // cleanup, free memory
-void dt_graph_repurpose(dt_graph_t *g);                    // reset logical state, keep Vulkan objects
+VkResult dt_graph_cleanup(dt_graph_t *g);   // cleanup, free memory
+VkResult dt_graph_repurpose(dt_graph_t *g); // reset logical state, keep Vulkan objects
 
 dt_node_t *dt_graph_get_display(dt_graph_t *g, dt_token_t  which);
 
@@ -183,7 +201,9 @@ VkResult dt_graph_run(
 
 void dt_token_print(dt_token_t t);
 
-VkResult dt_graph_create_shader_module(
+#ifndef VKDT_DSO_BUILD
+VKDT_API VkResult
+dt_graph_create_shader_module(
     dt_graph_t     *graph,  // only needed for debugging purposes
     dt_token_t      node,
     dt_token_t      kernel,
@@ -191,13 +211,14 @@ VkResult dt_graph_create_shader_module(
     VkShaderModule *shader_module);
 
 // return the memory allocation and VkImage etc corresponding to a node's connector
-dt_connector_image_t*
+VKDT_API dt_connector_image_t*
 dt_graph_connector_image(
     dt_graph_t *graph,
     int         nid,    // node id
     int         cid,    // connector id
     int         array,  // array index
     int         dbuf);  // double buffer index
+#endif
 
 // apply all keyframes found in the module list and write to the modules parameters according to
 // the current frame in the graph (g->frame). floating point parameters will be interpolated.

@@ -2,7 +2,8 @@
 // drag-to-adjust: select a parameter via the chord menu (or press its key),
 // then move the mouse horizontally to adjust it.  click or any key confirms;
 // esc restores to the value at arm time.  double-click resets to the module
-// default.  hold shift while dragging for 5x increased sensitivity.
+// default.  hold shift while dragging for fine tuning: the sensitivity is scaled by
+// NK_PROPERTY_FINE_SCALE, same as for slider widgets.
 // config files live in bin/dragkeys/ and ~/.config/vkdt/dragkeys/.
 // format:
 //   # comment
@@ -36,7 +37,6 @@
 #define DT_DRAGKEY_MAX_COMP_IDX   64  // sanity cap on component index at parse time (resolve checks actual param->cnt)
 #define DT_DRAGKEY_DBLCLICK_WIN  0.4  // seconds: window for double-click reset after commit
 #define DT_DRAGKEY_ARROW_STEP   10.0f // pixels equivalent per arrow key press
-#define DT_DRAGKEY_SHIFT_MULT   5.0f  // sensitivity multiplier while shift is held
 #define DT_DRAGKEY_2D_SCALE     4.0f  // sensitivity reduction for 2D (multi-axis) drags
 
 typedef struct dt_dragkey_comp_t
@@ -75,7 +75,7 @@ typedef struct dt_dragkeys_t
   double start_x;           // mouse x at arm time
   double start_y;           // mouse y at arm time (for axis=1 components)
   double click_down_time;   // time of first left-press while latched; 0 = no pending click
-  int    shift;             // 1 = shift held, coarse adjustment active
+  int    shift;             // 1 = shift held, fine adjustment active
   int    key_xdec[2];      // x-axis step-decrease: [0]=primary (LEFT),  [1]=alt (H)
   int    key_xinc[2];      // x-axis step-increase: [0]=primary (RIGHT), [1]=alt (L)
   int    key_ydec[2];      // y-axis step-decrease: [0]=primary (DOWN),  [1]=alt (J)
@@ -214,7 +214,7 @@ dt_dragkey_commit(dt_dragkey_t *d)
     for(int k = 0; k < j; k++)
       if(d->comp[k].modid == c->modid && d->comp[k].parid == c->parid) { dup = 1; break; }
     if(dup) continue;
-    vkdt.graph_dev.active_module = c->modid;
+    // vkdt.graph_dev.active_module = c->modid;
     dt_graph_history_append(&vkdt.graph_dev, c->modid, c->parid, 0.0);
   }
 }
@@ -254,7 +254,7 @@ dt_dragkey_reset(dt_dragkey_t *d)
     if(vkdt.graph_dev.module[c->modid].so->check_params)
       runflags |= vkdt.graph_dev.module[c->modid].so->check_params(
           vkdt.graph_dev.module + c->modid, c->parid, c->component, &oldval);
-    vkdt.graph_dev.active_module = c->modid;
+    // vkdt.graph_dev.active_module = c->modid;
     dt_graph_history_append(&vkdt.graph_dev, c->modid, c->parid, 0.0);
   }
   vkdt.graph_dev.runflags = runflags;
@@ -358,13 +358,49 @@ dt_dragkey_activate_named(dt_dragkeys_t *dk, const char *name)
   return 1;
 }
 
+static inline void
+dt_dragkey_set_value_internal(
+    dt_dragkeys_t *dk,
+    float new_val,
+    int   step_axis,
+    int   dir)
+{
+  dt_dragkey_t *d = &dk->menu_dk;
+  char msg[128];
+  int off = snprintf(msg, sizeof(msg), "%s:", d->name);
+  dt_graph_run_t runflags = s_graph_run_record_cmd_buf;
+  for(int j = 0; j < d->comp_cnt; j++)
+  {
+    dt_dragkey_comp_t *c = d->comp + j;
+    if(c->modid < 0 || c->parid < 0 || c->axis != step_axis) continue;
+    float *val = (float *)dt_module_param_float(vkdt.graph_dev.module + c->modid, c->parid);
+    if(!val) continue;
+    if(dir) new_val = val[c->component] + dir * c->sensitivity * DT_DRAGKEY_ARROW_STEP * (dk->shift ? NK_PROPERTY_FINE_SCALE : 1.0f);
+    if(c->min_val < c->max_val) new_val = CLAMP(new_val, c->min_val, c->max_val);
+    float oldval = val[c->component];
+    val[c->component] = new_val;
+    if(vkdt.graph_dev.module[c->modid].so->check_params)
+    runflags |= vkdt.graph_dev.module[c->modid].so->check_params(
+        vkdt.graph_dev.module + c->modid, c->parid, c->component, &oldval);
+    if(off < (int)sizeof(msg) - 20)
+      off += snprintf(msg + off, sizeof(msg) - off, " %.3f", new_val);
+  }
+  vkdt.graph_dev.runflags = runflags;
+  dt_gui_notification("%s", msg);
+  dt_dragkeys_reanchor(dk); // re-anchor so subsequent mouse movement starts from the stepped value
+}
+
 // called from darkroom_keyboard. returns 1 if the event was consumed.
 static inline int
 dt_dragkey_keyboard(dt_dragkeys_t *dk, int key, int action, int mods)
 {
   (void)mods;
+  static char number[32] = {0};
+  static int  number_pos = 0;
   if(action == GLFW_PRESS && !dk->latched)
   {
+    number[0] = 0;
+    number_pos = 0;
     for(int i = 0; i < dk->cnt; i++)
     {
       if(dk->dk[i].key != key) continue;
@@ -387,38 +423,27 @@ dt_dragkey_keyboard(dt_dragkeys_t *dk, int key, int action, int mods)
     { // step the parameter and stay armed (hold for repeat)
       int step_axis = (is_ydec || is_yinc) ? 1 : 0;
       float dir = (is_xinc || is_yinc) ? 1.0f : -1.0f;
-      dt_dragkey_t *d = &dk->menu_dk;
-      char msg[128];
-      int off = snprintf(msg, sizeof(msg), "%s:", d->name);
-      dt_graph_run_t runflags = s_graph_run_record_cmd_buf;
-      for(int j = 0; j < d->comp_cnt; j++)
-      {
-        dt_dragkey_comp_t *c = d->comp + j;
-        if(c->modid < 0 || c->parid < 0) continue;
-        if(c->axis != step_axis) continue;
-        float *val = (float *)dt_module_param_float(vkdt.graph_dev.module + c->modid, c->parid);
-        if(!val) continue;
-        float new_val = val[c->component] + dir * c->sensitivity * DT_DRAGKEY_ARROW_STEP * (dk->shift ? DT_DRAGKEY_SHIFT_MULT : 1.0f);
-        if(c->min_val < c->max_val)
-        {
-          if(new_val < c->min_val) new_val = c->min_val;
-          if(new_val > c->max_val) new_val = c->max_val;
-        }
-        float oldval = val[c->component];
-        val[c->component] = new_val;
-        if(vkdt.graph_dev.module[c->modid].so->check_params)
-          runflags |= vkdt.graph_dev.module[c->modid].so->check_params(
-              vkdt.graph_dev.module + c->modid, c->parid, c->component, &oldval);
-        if(off < (int)sizeof(msg) - 20)
-          off += snprintf(msg + off, sizeof(msg) - off, " %.3f", new_val);
-      }
-      vkdt.graph_dev.runflags = runflags;
-      dt_dragkeys_reanchor(dk); // re-anchor so subsequent mouse movement starts from the stepped value
-      dt_gui_notification("%s", msg);
+      dt_dragkey_set_value_internal(dk, 0, step_axis, dir);
+      return 1;
+    }
+    else if((action == GLFW_PRESS &&
+          ((key >= GLFW_KEY_0 && key <= GLFW_KEY_9) ||
+           (key == GLFW_KEY_PERIOD) ||
+           (key == GLFW_KEY_MINUS))))
+    { // typed number, write into a string, parse it and put into value
+      char c = 0;
+      if(key == GLFW_KEY_PERIOD) c = '.';
+      else if(key == GLFW_KEY_MINUS) c = '-';
+      else if(key >= GLFW_KEY_0) c = '0' + key - GLFW_KEY_0;
+      number[number_pos] = c;
+      if(number_pos < sizeof(number)-1) number_pos++;
+      number[number_pos] = 0;
+      float new_val = atof(number);
+      dt_dragkey_set_value_internal(dk, new_val, 0, 0);
       return 1;
     }
     if(key == GLFW_KEY_LEFT_SHIFT || key == GLFW_KEY_RIGHT_SHIFT)
-    { // shift toggles coarse multiplier; track via event so mouse_move doesn't need to poll
+    { // shift toggles the fine adjustment divisor; track via event so mouse_move doesn't need to poll
       if(action != GLFW_REPEAT)
       {
         int new_shift = (action == GLFW_PRESS);
@@ -433,6 +458,8 @@ dt_dragkey_keyboard(dt_dragkeys_t *dk, int key, int action, int mods)
       return 1; // other modifier keys don't commit
     if(action == GLFW_PRESS)
     { // any other key: confirm (esc = cancel/restore)
+      number[0] = 0;
+      number_pos = 0;
       dt_dragkeys_exit(dk, key != GLFW_KEY_ESCAPE);
       return 1;
     }
@@ -461,7 +488,7 @@ dt_dragkey_mouse_move(dt_dragkeys_t *dk, double x, double y)
   dt_dragkey_t *d = &dk->menu_dk;
   float dx = (float)(x - dk->start_x);
   float dy = (float)(y - dk->start_y);
-  if(dk->shift) { dx *= DT_DRAGKEY_SHIFT_MULT; dy *= DT_DRAGKEY_SHIFT_MULT; }
+  if(dk->shift) { dx *= NK_PROPERTY_FINE_SCALE; dy *= NK_PROPERTY_FINE_SCALE; }
   char msg[128];
   int off = 0;
   off += snprintf(msg + off, sizeof(msg) - off, "%s:", d->name);
@@ -513,8 +540,8 @@ dt_dragkey_mouse_move(dt_dragkeys_t *dk, double x, double y)
       for(int k=0;k<3;k++) disp[k] *= scale;
       float ox = (dist_sq - 1.0f) * wx;
       float oy = (dist_sq - 1.0f) * wy;
-      if(dk->shift) ox /= DT_DRAGKEY_SHIFT_MULT;
-      if(dk->shift) oy /= DT_DRAGKEY_SHIFT_MULT;
+      if(dk->shift) ox /= NK_PROPERTY_FINE_SCALE;
+      if(dk->shift) oy /= NK_PROPERTY_FINE_SCALE;
       dk->start_x += ox * rt32 / d->comp[0].sensitivity;
       dk->start_y += oy * rt32 / d->comp[1].sensitivity;
     }

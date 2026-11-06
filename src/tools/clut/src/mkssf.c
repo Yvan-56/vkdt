@@ -2,6 +2,7 @@
 #include "core/solve.h"
 #include "core/lut.h"
 #include "core/fs.h"
+#include "core/xrand.h"
 #include "cie1931.h"
 #include "cc24.h"
 #include "sigmoid.h"
@@ -9,18 +10,19 @@
 #include "matrices.h"
 #include "dngproc.h"
 #include "cfa.h"
-#include "xrand.h"
 #include "upsample.h"
 
 // global configuration:
 // - cfa model: plain gauss sigmoid pca
 // - optimiser: gauss/newton adam nelder/mead
 // - parameter: number of iterations
-static int num_it        = 80;
-static int num_epochs    = 6;
-static int cfa_model     = 2;          // default to gauss
-static int cfa_num_coeff = 30;
-static double cfa_param[3*36] = {0.1}; // init to something. zero has zero derivatives and is thus bad.
+static int num_it        = 300;
+static int num_epochs    = 10;
+static int cfa_model     = 4;          // default to plain
+static int cfa_num_coeff = 36;
+static double cfa_param[3*36] = {0.1}; // init to something. zero often has zero derivatives and is thus bad.
+static double learning_rate = 0.001;   // used only for adam
+static double smoothness = 0.3;        // add this much of the smoothness term
 
 static double ill[2][CIE2_SAMPLES];    // tabulated illuminants for the two target shots
 static int ill_cnt = 2;
@@ -34,7 +36,7 @@ static double ref[240][3];             // cc24 patches reference integrated agai
 static dng_profile_t profile_a;
 static dng_profile_t profile_d65;
 
-static const int upsample_cnt = 60;    // to silence warnings, we use fixed buffer sizes, so keep this < 240 please
+static const int upsample_cnt = 32;    // to silence warnings, we use fixed buffer sizes, so keep this < 240 please
 static double upsample_xy[240][2];
 static dt_lut_header_t lut_header = {0};
 static float *lut_buf = 0;
@@ -124,15 +126,25 @@ void integrate_ref_upsample(
 
 void refresh_upsample()
 {
-  for(int s=0;s<upsample_cnt;s++)
-  {
-    double x = 1.0/3.0, y = 1.0/3.0, z = 1.0/3.0;
-    const double r = 0.18;
-    for(int k=0;k<3;k++) x += r*(xrand() - 0.5);
-    for(int k=0;k<3;k++) y += r*(xrand() - 0.5);
-    for(int k=0;k<3;k++) z += r*(xrand() - 0.5);
-    upsample_xy[s][0] = x / (x+y+z);
-    upsample_xy[s][1] = y / (x+y+z);
+  int s=0;
+#if 1
+  for(;s<24;s++)
+  { // xy coordinates of colour checker
+    int i = s % 24;
+    double xyz[] = { cc24_xyz[3*i+0], cc24_xyz[3*i+1], cc24_xyz[3*i+2] };
+    xyz[0] += (1.0-xrand())*0.04;
+    xyz[1] += (1.0-xrand())*0.04;
+    xyz[2] += (1.0-xrand())*0.04;
+    upsample_xy[s][0] = xyz[0] / (xyz[0]+xyz[1]+xyz[2]);
+    upsample_xy[s][1] = xyz[1] / (xyz[0]+xyz[1]+xyz[2]);
+  }
+#endif
+  for(;s<upsample_cnt;s++)
+  { // we only trust the dcp inside srgb:
+    double xyz[3], srgb[3] = {xrand(), xrand(), xrand()};
+    mat3_mulv(srgb_to_xyz, srgb, xyz);
+    upsample_xy[s][0] = xyz[0] / (xyz[0]+xyz[1]+xyz[2]);
+    upsample_xy[s][1] = xyz[1] / (xyz[0]+xyz[1]+xyz[2]);
   }
   integrate_ref_upsample(ref);
 }
@@ -178,6 +190,21 @@ void integrate_cfa_upsample(
   for(int s=0;s<upsample_cnt;s++) for(int k=0;k<3;k++)
     res[s][k] *= (cc24_wavelengths[cc24_nwavelengths-1] - cc24_wavelengths[0]) /
       (double)cc24_nwavelengths;
+}
+
+// integrate white patch against illuminant to compute relative exposure
+double integrate_exposure_delta(
+    const double *ill)        // pass cie_a or cie_d65 here
+{
+  double v = 0.0;
+  for(int i=0;i<cc24_nwavelengths;i++)
+  {
+    const int s = 18; // brightest white patch
+    v += cc24_spectra[s][i] * cie_interp(ill, cc24_wavelengths[i]);
+  }
+  v *= (cc24_wavelengths[cc24_nwavelengths-1] - cc24_wavelengths[0]) /
+    (double)cc24_nwavelengths;
+  return v;
 }
 
 // integrate with cfa in the loop: cc24 * (A|D65) * cfa = camera rgb
@@ -263,7 +290,7 @@ void loss(
     }
   }
   // smoothness term:
-  err += 1e-5 * cfa_smoothness(cfa_model, cfa_num_coeff, p);
+  err += smoothness * cfa_smoothness(cfa_model, cfa_num_coeff, p);
   x[0] = err;
 }
 
@@ -295,7 +322,7 @@ void loss_pictures(
     }
   }
   // smoothness term:
-  err += 1e-5 * cfa_smoothness(cfa_model, cfa_num_coeff, p);
+  err += smoothness * cfa_smoothness(cfa_model, cfa_num_coeff, p);
   x[0] = err;
 }
 
@@ -324,7 +351,7 @@ void loss_upsample(
     }
   }
   // smoothness term:
-  err += 1e-5 * cfa_smoothness(cfa_model, cfa_num_coeff, p);
+  err += smoothness * cfa_smoothness(cfa_model, cfa_num_coeff, p);
   x[0] = err;
 }
 
@@ -425,6 +452,8 @@ int main(int argc, char *argv[])
     else if(!strcmp(argv[k], "--num-epochs") && k+1 < argc) num_epochs = atol(argv[++k]);
     else if(!strcmp(argv[k], "--cfa-model" ) && k+1 < argc) cfa_model = cfa_model_parse(argv[++k]);
     else if(!strcmp(argv[k], "--num-coeff" ) && k+1 < argc) cfa_num_coeff = CLAMP(atol(argv[++k]), 1, 36);
+    else if(!strcmp(argv[k], "--lr"        ) && k+1 < argc) learning_rate = CLAMP(atof(argv[++k]), 1e-30, 100.0);
+    else if(!strcmp(argv[k], "--smooth"    ) && k+1 < argc) smoothness = CLAMP(atof(argv[++k]), 1e-30, 1e10);
     else if(!strcmp(argv[k], "--single-ill")) ill_cnt = 1;
     else if(!strcmp(argv[k], "--opt") && k+1 < argc) optimiser = parse_optimiser(argv[++k]);
     else if(argv[k][0] != '-') model = argv[k];
@@ -451,6 +480,8 @@ int main(int argc, char *argv[])
                     "          --cfa-model <mod>  choose <mod> as a cfa model from:\n"
                     "                             pca, gauss, sigmoid, plain\n"
                     "          --num-coeff <n>    use this number of coefficients in the model\n"
+                    "          --lr <l>           learning rate (for adam, default 0.001)\n"
+                    "          --smooth <s>       smoothness term multiplier\n"
                     "          --opt <op>         use as optimiser one of\n"
                     "                             gauss-newton, adam, nelder-mead\n");
 
@@ -513,6 +544,23 @@ int main(int argc, char *argv[])
     fscanf(f, "param:pick:01:picked:%lf:%lf:%lf",   &ref_picked_d65[0][0], &ref_picked_d65[0][1], &ref_picked_d65[0][2]);
     for(int i=1;i<24;i++) fscanf(f, ":%lf:%lf:%lf", &ref_picked_d65[i][0], &ref_picked_d65[i][1], &ref_picked_d65[i][2]);
     fclose(f);
+
+    // normalise a/d65 by integrating cc24 white against cie_d65 and cie_a, deriving a relative exposure,
+    // and applying the same relative exposure to all picked_a vs picked_d65 patches
+    double v_d65 = integrate_exposure_delta(cie_d65);
+    double v_a   = integrate_exposure_delta(cie_a);
+    double rel_v = v_d65 / v_a;
+    double rel_d = ref_picked_d65[18][1]/ref_picked_a[18][1];
+    fprintf(stderr, "relative exposure of white patch in reference: %g/%g = %g and data %g/%g = %g\n",
+        v_d65, v_a, rel_v,
+        ref_picked_d65[18][1], ref_picked_a[18][1],
+        ref_picked_d65[18][1]/ref_picked_a[18][1]);
+    for(int i=0;i<24;i++)
+      for(int k=0;k<3;k++)
+        ref_picked_a[i][k] *= rel_d / rel_v;
+    fprintf(stderr, "normalised relative exposure in data %g/%g = %g\n",
+        ref_picked_d65[18][1], ref_picked_a[18][1],
+        ref_picked_d65[18][1]/ref_picked_a[18][1]);
   }
 
   // init ref by integrating against cie observer
@@ -530,6 +578,7 @@ int main(int argc, char *argv[])
   double resid = 0.0;
   for(int e=0;e<num_epochs;e++)
   {
+    fprintf(stderr, "[epoch %d/%d]\n", e, num_epochs);
     refresh_upsample(); // compute new dataset/reference
     if(optimiser == 1)
     {
@@ -549,7 +598,7 @@ int main(int argc, char *argv[])
           pick_a ? loss_pictures_dif : loss_upsample_dif,
           cfa_param, &target, 3*cfa_num_coeff, 1,
           lb, ub, num_it, 0,
-          1e-8, 0.9, 0.99, .005, 0);
+          1e-8, 0.9, 0.99, learning_rate, 0);
     }
     else // optimiser == 3
     {
@@ -573,7 +622,10 @@ int main(int argc, char *argv[])
   fprintf(fh, "<html><body><h1>%s</h1>\n", profile_a.model);
   fprintf(fh, "<div style='width:30%%;float:left'>\n");
   fprintf(fh, "<h2>A | CIE | D65</h2>\n");
-  fprintf(fh, "<p>illuminant A + cfa + dng profile, illuminant D65 + cfa + dng profile, vs. ground truth cie observer in the middle</p>\n");
+  if(pick_a)
+    fprintf(fh, "<p>illuminant A &times; cfa, illuminant D65 &times; cfa, vs. cie observer in the middle</p>\n");
+  else
+    fprintf(fh, "<p>illuminant A &times; cfa + dng profile, illuminant D65 &times; cfa + dng profile, vs. ground truth cie observer in the middle</p>\n");
   fprintf(fh, "<table style='border-spacing:0;border-collapse:collapse'><tr>\n");
   double res[240][3];
   double rgb_a[240][3], rgb_d65[240][3], rgb_cie[240][3];
@@ -587,6 +639,7 @@ int main(int argc, char *argv[])
     normalise_col(xyz);
     mat3_mulv(xyz_to_srgb, xyz, rgb_a[s]); // really not d50 xyz but whatever for debug
   }
+  if(pick_a) for(int s=0;s<24;s++) for(int k=0;k<3;k++) rgb_a[s][k] = res[s][k]; // no dng profile
   integrate_cfa(res, cfa_param, cie_d65);
   // integrate_cfa_upsample(res, cfa_param, cie_d65);
   for(int s=0;s<24;s++)
@@ -595,6 +648,7 @@ int main(int argc, char *argv[])
     normalise_col(xyz);
     mat3_mulv(xyz_to_srgb, xyz, rgb_d65[s]);
   }
+  if(pick_a) for(int s=0;s<24;s++) for(int k=0;k<3;k++) rgb_d65[s][k] = res[s][k]; // no dng profile
   for(int s=0;s<24;s++)
     mat3_mulv(xyz_to_srgb, ref[s], rgb_cie[s]);
 

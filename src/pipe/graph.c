@@ -13,8 +13,8 @@
 #include "db/stringpool.h"
 #endif
 #include "cycles.h"
-#include "graph-run-modules.h"
 #include "graph-run-nodes-allocate.h"
+#include "graph-run-modules.h"
 #include "graph-run-nodes-upload.h"
 #include "graph-run-nodes-record-cmd.h"
 #include "graph-run-nodes-download.h"
@@ -47,10 +47,6 @@ dt_graph_init(dt_graph_t *g, qvk_queue_name_t qname)
   g->module = calloc(sizeof(dt_module_t), g->max_modules);
   g->max_nodes = 4000;
   g->node = calloc(sizeof(dt_node_t), g->max_nodes);
-  dt_vkalloc_init(&g->heap, 16000, ((uint64_t)1)<<40); // bytesize doesn't matter
-  dt_vkalloc_init(&g->heap_1, 16000, ((uint64_t)1)<<40);
-  dt_vkalloc_init(&g->heap_staging, 100, ((uint64_t)1)<<40);
-  dt_vkalloc_init(&g->heap_protected, 16000, ((uint64_t)1)<<40);
   g->params_max = 16u<<20;
   g->params_end = 0;
   g->params_pool = calloc(sizeof(uint8_t), g->params_max);
@@ -95,8 +91,34 @@ dt_graph_init(dt_graph_t *g, qvk_queue_name_t qname)
     .pNext = &timelineCreateInfo,
     .flags = 0,
   };
-  vkCreateSemaphore(qvk.device, &createInfo, NULL, &g->semaphore_display);
   vkCreateSemaphore(qvk.device, &createInfo, NULL, &g->semaphore_process);
+  vkCreateSemaphore(qvk.device, &createInfo, NULL, &g->semaphore_extra);
+  
+  { // init temporary command buffer
+    VkCommandPoolCreateInfo create_pool = {
+      .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+      .flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT | VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
+      .queueFamilyIndex = qvk.queue[s_queue_compute].family,
+    };
+    QVK(vkCreateCommandPool(qvk.device, &create_pool, 0, &g->tmp_cmd_pool));
+    VkCommandBufferAllocateInfo cmd_alloc = {
+      .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+      .commandPool = g->tmp_cmd_pool,
+      .commandBufferCount = 1,
+    };
+    QVK(vkAllocateCommandBuffers(qvk.device, &cmd_alloc, &g->tmp_cmd));
+    VkSemaphoreTypeCreateInfoKHR type_sem = {
+      .sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO_KHR,
+      .semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE_KHR,
+      .initialValue  = 0,
+    };
+    VkSemaphoreCreateInfo create_sem = {
+      .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO,
+      .pNext = &type_sem
+    };
+    QVK(vkCreateSemaphore(qvk.device, &create_sem, 0, &g->tmp_sem));
+  }
+
   for(int i=0;i<2;i++)
   {
     g->query[i].max = 2000;
@@ -115,6 +137,8 @@ dt_graph_init(dt_graph_t *g, qvk_queue_name_t qname)
   g->lod_scale = 1;
   g->active_module = -1;
   dt_graph_init_mipmap(g);
+
+  dt_graph_alloc_external_resources(g);
 }
 
 // Destroy per-image/per-graph-structure Vulkan resources: connector images,
@@ -184,12 +208,11 @@ graph_destroy_per_image_resources(dt_graph_t *g)
 static VkResult
 graph_wait_gpu(dt_graph_t *g, const char *caller)
 {
-  // if no gui is attached, display indices stay at 0, so this is a no-op
   const uint64_t wait_value[] = {
-    MAX(g->display_dbuffer[0], g->display_dbuffer[1]),
-    MAX(g->process_dbuffer[0], g->process_dbuffer[1]),
+    g->timeline_value,
+    g->semaphore_extra_val,
   };
-  VkSemaphore sem[] = { g->semaphore_display, g->semaphore_process };
+  VkSemaphore sem[] = { g->semaphore_process, g->semaphore_extra };
   VkSemaphoreWaitInfo wait_info = {
     .sType          = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO,
     .semaphoreCount = 2,
@@ -224,38 +247,34 @@ graph_teardown_modules(dt_graph_t *g)
   }
 }
 
-void
+VkResult
 dt_graph_cleanup(dt_graph_t *g)
 {
-  if(!g->module) return; // already cleaned up
+  if(!g->module) return VK_SUCCESS; // already cleaned up
 #ifdef DEBUG_MARKERS
   dt_stringpool_cleanup(&g->debug_markers);
 #endif
   g->active_module = -1;
-  if(graph_wait_gpu(g, "graph_cleanup") != VK_SUCCESS) return;
+  if(graph_wait_gpu(g, "graph_cleanup") != VK_SUCCESS) return VK_INCOMPLETE;
   graph_teardown_modules(g);
-  dt_vkalloc_cleanup(&g->heap);
-  dt_vkalloc_cleanup(&g->heap_1);
-  dt_vkalloc_cleanup(&g->heap_staging);
-  dt_vkalloc_cleanup(&g->heap_protected);
+  for(int i=0;i<g->memory_cnt;i++)
+    dt_vkalloc_cleanup(&g->memory[i].heap);
   graph_destroy_per_image_resources(g);
+  for(int i=0;i<g->memory_cnt;i++)
+    vkFreeMemory(qvk.device, g->memory[i].vkmem, 0);
   vkDestroyDescriptorPool(qvk.device, g->dset_pool, 0);
   vkDestroyDescriptorSetLayout(qvk.device, g->uniform_dset_layout, 0);
   vkDestroyBuffer(qvk.device, g->uniform_buffer, 0);
   g->dset_pool = 0;
   g->uniform_dset_layout = 0;
   g->uniform_buffer = 0;
-  vkFreeMemory(qvk.device, g->vkmem, 0);
-  vkFreeMemory(qvk.device, g->vkmem_1, 0);
-  vkFreeMemory(qvk.device, g->vkmem_staging, 0);
   vkFreeMemory(qvk.device, g->vkmem_uniform, 0);
-  vkFreeMemory(qvk.device, g->vkmem_protected, 0);
-  g->vkmem = g->vkmem_1 = g->vkmem_staging = g->vkmem_uniform = g->vkmem_protected = 0;
-  g->vkmem_size = g->vkmem_1_size = g->vkmem_staging_size = g->vkmem_uniform_size = g->vkmem_protected_size = 0;
-  vkDestroySemaphore(qvk.device, g->semaphore_display, 0);
+  g->vkmem_uniform = 0;
+  g->vkmem_uniform_size = 0;
   vkDestroySemaphore(qvk.device, g->semaphore_process, 0);
-  g->semaphore_display = 0;
+  vkDestroySemaphore(qvk.device, g->semaphore_extra, 0);
   g->semaphore_process = 0;
+  g->semaphore_extra   = 0;
   if(g->command_pool != VK_NULL_HANDLE)
     vkFreeCommandBuffers(qvk.device, g->command_pool, 2, g->command_buffer);
   g->command_buffer[0] = g->command_buffer[1] = VK_NULL_HANDLE;
@@ -268,6 +287,14 @@ dt_graph_cleanup(dt_graph_t *g)
     vkDestroyCommandPool(qvk.device, g->command_pool_gfx, 0);
     g->command_pool_gfx = 0;
   }
+
+  vkDestroySemaphore  (qvk.device, g->tmp_sem, 0);
+  vkFreeCommandBuffers(qvk.device, g->tmp_cmd_pool, 1, &g->tmp_cmd);
+  vkDestroyCommandPool(qvk.device, g->tmp_cmd_pool, 0);
+  g->tmp_sem = 0;
+  g->tmp_cmd = 0;
+  g->tmp_cmd_pool = 0;
+
   free(g->module);             g->module = 0;
   free(g->node);               g->node = 0;
   free(g->params_pool);        g->params_pool = 0;
@@ -282,6 +309,9 @@ dt_graph_cleanup(dt_graph_t *g)
     free(g->query[i].kernel);       g->query[i].kernel = 0;
   }
   dt_graph_cleanup_mipmap(g);
+  // if no external resources are allocated, does nothing:
+  dt_graph_free_external_resources(g);
+  return VK_SUCCESS;
 }
 
 static inline void *
@@ -334,17 +364,20 @@ dt_graph_create_shader_module(
   free(data);
 #if 0 // def DEBUG_MARKERS
 #ifdef QVK_ENABLE_VALIDATION
-  char name[100];
-  const char *dedup;
-  snprintf(name, sizeof(name), "%"PRItkn"_%"PRItkn, dt_token_str(node), dt_token_str(kernel));
-  dt_stringpool_get(&graph->debug_markers, name, strlen(name), 0, &dedup);
-  VkDebugMarkerObjectNameInfoEXT name_info = {
-    .sType = VK_STRUCTURE_TYPE_DEBUG_MARKER_OBJECT_NAME_INFO_EXT,
-    .object = (uint64_t) shader_module,
-    .objectType = VK_DEBUG_REPORT_OBJECT_TYPE_SHADER_MODULE_EXT,
-    .pObjectName = dedup,
-  };
-  qvkDebugMarkerSetObjectNameEXT(qvk.device, &name_info);
+  if(graph)
+  {
+    char name[100];
+    const char *dedup;
+    snprintf(name, sizeof(name), "%"PRItkn"_%"PRItkn, dt_token_str(node), dt_token_str(kernel));
+    dt_stringpool_get(&graph->debug_markers, name, strlen(name), 0, &dedup);
+    VkDebugMarkerObjectNameInfoEXT name_info = {
+      .sType = VK_STRUCTURE_TYPE_DEBUG_MARKER_OBJECT_NAME_INFO_EXT,
+      .object = (uint64_t) shader_module,
+      .objectType = VK_DEBUG_REPORT_OBJECT_TYPE_SHADER_MODULE_EXT,
+      .pObjectName = dedup,
+    };
+    qvkDebugMarkerSetObjectNameEXT(qvk.device, &name_info);
+  }
 #endif
 #endif
   return VK_SUCCESS;
@@ -724,6 +757,16 @@ dt_graph_print_run(
       run & s_graph_run_before_active ? "<active" : "");
 }
 
+static inline uint64_t 
+get_timeline_value(dt_graph_t *g)
+{
+  if(g->dspy && g->dspy_acquire) return g->dspy_acquire(g);
+  uint64_t value_process = 0; // what processing semaphore finished
+  VkResult res = vkGetSemaphoreCounterValue(qvk.device, g->semaphore_process, &value_process);
+  if(res != VK_SUCCESS) return 0; // uhm?
+  return value_process + 1;
+}
+
 VkResult dt_graph_run(
     dt_graph_t     *graph,
     dt_graph_run_t  run)
@@ -737,11 +780,14 @@ VkResult dt_graph_run(
   graph->gui_msg = 0;
 
   // wait for last invocation of our command buffer to finish:
+  // will be incremented below during acquire, we'll dispatch tv+1.
+  // the other dispatch would have run tv, and we previously tv-1
+  uint64_t timeline = MAX(1, graph->timeline_value) - 1;
   VkSemaphoreWaitInfo wait_info = {
     .sType          = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO,
     .semaphoreCount = 1,
     .pSemaphores    = &graph->semaphore_process,
-    .pValues        = &graph->process_dbuffer[buf_curr],
+    .pValues        = &timeline,
   };
   QVKR(vkWaitSemaphores(qvk.device, &wait_info, UINT64_MAX));
 
@@ -824,48 +870,54 @@ VkResult dt_graph_run(
     QVKR(dt_graph_run_modules_upload_uniforms(graph, run));
 
     // record command buffer, including memory barriers for transfers (to uniforms and staging)
+    if(run & s_graph_run_record_cmd_buf)
+    {
+      VkCommandBufferBeginInfo begin_info = {
+        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+        .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+      };
+      QVKR(vkBeginCommandBuffer(dt_graph_cmd_buf(graph), &begin_info));
+    }
     QVKR(dt_graph_run_nodes_record_cmd(graph, run, nodeid, cnt, module_flags));
   } // end scope, done with nodes
 
   if(run & s_graph_run_alloc)
   { // output memory statistics if we did any allocation at all
-    dt_log(s_log_mem, "images : peak rss %g MB vmsize %g MB",
-        graph->heap.peak_rss/(1024.0*1024.0),
-        graph->heap.vmsize  /(1024.0*1024.0));
-    dt_log(s_log_mem, "overflow : peak rss %g MB vmsize %g MB",
-        graph->heap_1.peak_rss/(1024.0*1024.0),
-        graph->heap_1.vmsize  /(1024.0*1024.0));
-    dt_log(s_log_mem, "protected : peak rss %g MB vmsize %g MB",
-        graph->heap_protected.peak_rss/(1024.0*1024.0),
-        graph->heap_protected.vmsize  /(1024.0*1024.0));
-    dt_log(s_log_mem, "staging: peak rss %g MB vmsize %g MB",
-        graph->heap_staging.peak_rss/(1024.0*1024.0),
-        graph->heap_staging.vmsize  /(1024.0*1024.0));
+    for(int i=0;i<graph->memory_cnt;i++)
+      dt_log(s_log_mem, "arena %u (type %u%s%s%s): peak rss %g MB vmsize %g MB", i,
+          graph->memory[i].memory_type,
+          qvk.mem_properties.memoryTypes[graph->memory[i].memory_type].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT ? ", host-visible" : "",
+          graph->memory[i].persistent ? ", persistent" : "",
+          graph->memory[i].low_32bit_offsets ? ", low32" : "",
+          graph->memory[i].heap.peak_rss/(1024.0*1024.0),
+          graph->memory[i].heap.vmsize  /(1024.0*1024.0));
   }
 
   double clock_end = dt_time();
   dt_log(s_log_perf, "record cmd buffer:\t%8.3f ms", 1000.0*(clock_end - clock_beg));
 
+
   if(run & s_graph_run_record_cmd_buf)
   {
-    graph->process_dbuffer[buf_curr] = MAX(graph->process_dbuffer[0], graph->process_dbuffer[1]) + 1;
-    // we add one more command list working on the buf_curr double buffer with write access
+    VkCommandBuffer cmd_buf = dt_graph_cmd_buf(graph);
+    graph->timeline_value = get_timeline_value(graph);
+    QVKR(vkEndCommandBuffer(cmd_buf));
+
+    VkPipelineStageFlagBits wait_stage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
     VkTimelineSemaphoreSubmitInfo timeline_info = {
       .sType                     = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO,
       .waitSemaphoreValueCount   = 1,
-      .pWaitSemaphoreValues      = &graph->display_dbuffer[buf_curr], // we want to write this buffer, wait for last display command to read it
+      .pWaitSemaphoreValues      = &graph->semaphore_extra_val,
       .signalSemaphoreValueCount = 1,
-      .pSignalSemaphoreValues    = &graph->process_dbuffer[buf_curr], // lock buf_curr for writing, this signal will remove the lock
+      .pSignalSemaphoreValues    = &graph->timeline_value, // signal this buffer is ready to display once we're done
     };
-    VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
-    VkCommandBuffer cmd_buf = dt_graph_cmd_buf(graph);
     VkSubmitInfo submit = {
       .sType                = VK_STRUCTURE_TYPE_SUBMIT_INFO,
       .commandBufferCount   = 1,
       .pCommandBuffers      = &cmd_buf,
       .pNext                = &timeline_info,
       .waitSemaphoreCount   = 1,
-      .pWaitSemaphores      = &graph->semaphore_display,
+      .pWaitSemaphores      = &graph->semaphore_extra,
       .pWaitDstStageMask    = &wait_stage,
       .signalSemaphoreCount = 1,
       .pSignalSemaphores    = &graph->semaphore_process,
@@ -881,7 +933,7 @@ VkResult dt_graph_run(
       .sType          = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO,
       .semaphoreCount = 1,
       .pSemaphores    = &graph->semaphore_process,
-      .pValues        = &graph->process_dbuffer[buf_curr],
+      .pValues        = &graph->timeline_value,
     };
     if(run & s_graph_run_wait_done) // no timeout
       QVKR(vkWaitSemaphores(qvk.device, &wait_info, UINT64_MAX));
@@ -890,17 +942,18 @@ VkResult dt_graph_run(
   // download sink data from GPU to CPU
   dt_graph_run_nodes_download(graph, run, module_flags);
 
-  if(dt_log_global.mask & s_log_perf)
+  if((run & s_graph_run_record_cmd_buf) && (dt_log_global.mask & s_log_perf))
   {
     int q = buf_prev;
     if(run & s_graph_run_wait_done) q = buf_curr; // if we're synchronous, use the one we just waited for
     else
     { // async, have to wait for previous queries to come back:
+      uint64_t prev_value = MAX(1, graph->timeline_value)-1;
       VkSemaphoreWaitInfo wait_info = {
         .sType          = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO,
         .semaphoreCount = 1,
         .pSemaphores    = &graph->semaphore_process,
-        .pValues        = &graph->process_dbuffer[buf_prev],
+        .pValues        = &prev_value,
       };
       QVKR(vkWaitSemaphores(qvk.device, &wait_info, UINT64_MAX));
     }
@@ -984,29 +1037,29 @@ dt_graph_connector_image(
     graph->node[nid].conn_image[cid] + MAX(1,graph->node[nid].connector[cid].array_length) * frame + array;
 }
 
-void
+VkResult
 dt_graph_repurpose(dt_graph_t *g)
 {
-  if(!g->module) return;
+  if(!g->module) return VK_SUCCESS;
 #ifdef DEBUG_MARKERS
   dt_stringpool_reset(&g->debug_markers);
 #endif
-  if(graph_wait_gpu(g, "graph_repurpose") != VK_SUCCESS) return;
+  if(graph_wait_gpu(g, "graph_repurpose") != VK_SUCCESS) return VK_INCOMPLETE;
   graph_teardown_modules(g);
   // clear logical allocators
-  dt_vkalloc_nuke(&g->heap);
-  dt_vkalloc_nuke(&g->heap_1);
-  dt_vkalloc_nuke(&g->heap_protected);
-  dt_vkalloc_nuke(&g->heap_staging);
+  for(int i=0;i<g->memory_cnt;i++)
+    dt_vkalloc_nuke(&g->memory[i].heap);
   graph_destroy_per_image_resources(g);
+  for(int i=0;i<g->memory_cnt;i++)
+  {
+    vkFreeMemory(qvk.device, g->memory[i].vkmem, 0);
+    g->memory[i].vkmem = 0;
+    g->memory[i].vkmem_size = 0;
+  }
   // free memory because this can be sizable:
-  vkFreeMemory(qvk.device, g->vkmem, 0);
-  vkFreeMemory(qvk.device, g->vkmem_1, 0);
-  vkFreeMemory(qvk.device, g->vkmem_staging, 0);
   vkFreeMemory(qvk.device, g->vkmem_uniform, 0);
-  vkFreeMemory(qvk.device, g->vkmem_protected, 0);
-  g->vkmem = g->vkmem_1 = g->vkmem_staging = g->vkmem_uniform = g->vkmem_protected = 0;
-  g->vkmem_size = g->vkmem_1_size = g->vkmem_staging_size = g->vkmem_uniform_size = g->vkmem_protected_size = 0;
+  g->vkmem_uniform = 0;
+  g->vkmem_uniform_size = 0;
   // reset command pool (reuse buffers, skip destroy/recreate)
   vkResetCommandPool(qvk.device, g->command_pool, 0);
   if(g->command_pool_gfx)
@@ -1029,8 +1082,10 @@ dt_graph_repurpose(dt_graph_t *g)
   g->thumbnail_image = 0; // owned externally
   g->history_item_cur = 0;
   g->history_item_end = 0;
+  if(g->ext_files) dt_stringpool_reset(g->ext_files);
   // keep display_dbuffer/process_dbuffer: semaphore signal values must be
   // strictly increasing, so the next run must continue from the current values
+  return VK_SUCCESS;
 }
 
 void

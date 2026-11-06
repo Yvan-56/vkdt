@@ -28,6 +28,7 @@ also see the [list of presets shipped with vkdt](../../../doc/howto/presets/pres
 * [o-copy: copy the input file to a new destination](./o-copy/readme.md)
 * [o-exr: write openexr image files](./o-exr/readme.md)
 * [o-jpg: write jpeg compressed still image](./o-jpg/readme.md)
+* [o-jxl: write jpeg-xl (supports wide gamut/hdr)](./o-jxl/readme.md)
 * [o-lut: write varying precision multi channel luts](./o-lut/readme.md)
 * [o-null: write absolutely nothing](./o-null/readme.md)
 * [o-pfm: write uncompressed 32-bit floating point image](./o-pfm/readme.md)
@@ -58,7 +59,7 @@ also see the [list of presets shipped with vkdt](../../../doc/howto/presets/pres
 **output display transform/tonemapping**
 
 * [filmcurv: display transform curve](./filmcurv/readme.md)
-* [filmsim: spectral analog film simulation](./filmsim/readme.md)
+* [filmsim: spectral analog film simulation based on spektrafilm](./filmsim/readme.md)
 * [OpenDRT: sophisticated display transform with some colour correction options](./OpenDRT/readme.md)
 * [reinhard: reinhard histogram compression for hdr data](./reinhard/readme.md)
 
@@ -68,6 +69,7 @@ also see the [list of presets shipped with vkdt](../../../doc/howto/presets/pres
 * [colour: generic colour manipulation/input device transform](./colour/readme.md)
 * [curves: rgb and 3x3 ych curve widgets](./curves/readme.md)
 * [grade: simple ACES CDL grading tool](./grade/readme.md)
+* [okgmtclp: gamut clipping in oklab space](./okgmtclp/readme.md)
 
 **corrective**
 
@@ -98,6 +100,8 @@ also see the [list of presets shipped with vkdt](../../../doc/howto/presets/pres
 * [guided: guided filter blur module, useful for refining drawn masks](./guided/readme.md)
 * [inpaint: smooth reconstruction of masked out areas](./inpaint/readme.md)
 * [mask: create parametric masks from colour images for use with blending](./mask/readme.md)
+* [segment: masks of people, sky, vegetation, buildings and more, using a neural network](./segment/readme.md)
+* [select: select an object by clicking on it, using a neural network](./select/readme.md)
 * [wavelet: skin retouching](./wavelet/readme.md)
 
 **effects/decoration**
@@ -238,6 +242,8 @@ the ui supports the following widgets
 * `slider` takes `min:max` as range argument
 * `vslider` a vertical slider. takes `min:max` as range argument
 * `callback` a special button that triggers the `ui_callback` function in the module
+* `click` add to or remove from a selection by clicking on the image, drag a box
+  around the object into the `box` parameter of the same module
 * `colour` 
 * `combo` a combobox. takes the `:`-separated list of string entries as argument
 * `crop` the crop tool of the crop/rotate module

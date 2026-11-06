@@ -43,8 +43,6 @@ create_nodes(dt_graph_t *graph, dt_module_t *module, uint64_t *uniform_offset)
     module->param_size;
   u_size = (u_size + qvk.uniform_alignment-1) & -qvk.uniform_alignment;
   *uniform_offset += u_size;
-  // TODO: if roi size/scale does not match, insert resample node!
-  // TODO: where? inside create_nodes? or we fix it afterwards?
   if(module->disabled)
   {
     int mc_in = -1, mc_out = -1;
@@ -107,63 +105,6 @@ create_nodes(dt_graph_t *graph, dt_module_t *module, uint64_t *uniform_offset)
   }
   module->uniform_offset = u_offset;
   module->uniform_size   = u_size;
-}
-
-static inline void
-init_display_flags(dt_graph_t *graph, dt_module_t *module)
-{
-  if(module->name == dt_token("display"))
-  { // if this is a display module, walk our input connector and make the connection double buffered
-    dt_connector_t *c = module->connector; // display has connector 0 as the input
-    if(!dt_cid_unset(c->connected))
-    {
-      int extra_flag = s_conn_double_buffer;
-      if(qvk.blit_supported && module->inst == dt_token("main"))
-        extra_flag |= s_conn_mipmap;
-      // mark output connector feeding this display for concurrent queue sharing when:
-      // - a gui is attached (i.e. this is a live darkroom session, not batch export)
-      // - the hardware has a dedicated async compute queue family
-      // - no rasterisation nodes are present (draw/overlay use the graphics queue and
-      //   cannot be submitted on a pure compute queue)
-      if(graph->gui_attached &&
-         qvk.queue_family_compute != qvk.queue_family_graphics)
-      {
-        int has_graphics_node = 0;
-        for(int n=0;n<graph->num_nodes;n++)
-          if(graph->node[n].type == s_node_graphics) { has_graphics_node = 1; break; }
-        if(!has_graphics_node)
-          extra_flag |= s_conn_concurrent;
-      }
-      c->flags |= extra_flag;
-
-      // find node corresponding to our display module
-      int ni = c->associated.i;
-      int nc = c->associated.c;
-      c = graph->node[ni].connector + nc;
-      if(dt_cid_unset(c->connected)) return;
-      int ni1 = c->connected.i;
-      int nc1 = c->connected.c;
-      graph->node[ni1].connector[nc1].flags |= extra_flag;
-      c->frames = graph->node[ni1].connector[nc1].frames = 2;
-      // also every input connected to the output we're referring to here needs to be updated!
-      // this is different from feedback connectors who can happily access both buffers at their dispatch stage.
-      // since we're adding the flag so late, it's our responsibility to propagate it. on the bright side
-      // the graph topology is fixed now, so we can safely do this:
-      for(int n=0;n<graph->num_nodes;n++)
-      {
-        for(int i=0;i<graph->node[n].num_connectors;i++)
-        {
-          if(dt_connector_input(graph->node[n].connector+i) &&
-              graph->node[n].connector[i].connected.i == ni1 &&
-              graph->node[n].connector[i].connected.c == nc1)
-          {
-            graph->node[n].connector[i].flags |= extra_flag;
-            graph->node[n].connector[i].frames = 2;
-          }
-        }
-      }
-    }
-  }
 }
 
 static inline void
@@ -691,13 +632,13 @@ dt_graph_run_modules(
           }
         }
       }
-    const uint64_t wait_value[] = {
-      MAX(graph->display_dbuffer[0], graph->display_dbuffer[1]),
-      MAX(graph->process_dbuffer[0], graph->process_dbuffer[1]),
-    };
     VkSemaphore sem[] = {
-      graph->semaphore_display,
       graph->semaphore_process,
+      graph->semaphore_extra,
+    };
+    const uint64_t wait_value[] = {
+      graph->timeline_value,
+      graph->semaphore_extra_val,
     };
     VkSemaphoreWaitInfo wait_info = {
       .sType          = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO,
@@ -719,7 +660,10 @@ dt_graph_run_modules(
     graph->conn_image_end = 0;
     for(int i=0;i<cnt;i++)
       for(int j=0;j<graph->module[modid[i]].num_connectors;j++)
+      {
         graph->module[modid[i]].connector[j].associated = s_cid_unset;
+        graph->module[modid[i]].connector[j].bypass = s_cid_unset;
+      }
     for(int i=0;i<graph->num_nodes;i++)
     {
       for(int j=0;j<graph->node[i].num_connectors;j++)
@@ -810,9 +754,6 @@ dt_graph_run_modules(
         }
       }
     }
-    for(int i=0;i<cnt;i++)
-      if(graph->module[modid[i]].connector[0].roi.full_wd > 0)
-        init_display_flags(graph, graph->module+modid[i]);
     init_connector_images(graph);
   }
   // one last check:

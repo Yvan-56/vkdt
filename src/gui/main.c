@@ -207,6 +207,7 @@ int main(int argc, char *argv[])
   glfwSetScrollCallback(vkdt.win.window, scroll_callback);
   glfwSetWindowCloseCallback(vkdt.win.window, window_close_callback);
   glfwSetWindowFocusCallback(vkdt.win.window, window_focus_callback);
+  glfwSetJoystickCallback(joystick_callback);
 #if VKDT_USE_PENTABLET==1
   glfwSetPenTabletDataCallback(pentablet_data_callback);
   glfwSetPenTabletCursorCallback(pentablet_cursor_callback);
@@ -223,7 +224,8 @@ int main(int argc, char *argv[])
   dt_thumbnails_init(&vkdt.thumbnail_gen, 400, 400, 0, 0);
   // start out with 200/16MB images:
   uint64_t tncs = CLAMP(dt_rc_get_int(&vkdt.rc, "gui/thumbnail_cache_MB", 16), 1, 2048);
-  dt_thumbnails_init(&vkdt.thumbnails, 400, 400, tncs*16, tncs*(1ul<<20));
+  // a bc1 is usually like 50k in size for the 400x400 window. that's 20 images, give it a bit more:
+  dt_thumbnails_init(&vkdt.thumbnails, 400, 400, tncs*21, tncs*(1ul<<20));
   dt_db_init(&vkdt.db);
   char *filename = 0;
   {
@@ -279,21 +281,22 @@ int main(int argc, char *argv[])
     // vkdt.wstate.busy = 100; // do these two lines instead if profiling in nvidia gfx insight or so.
     // vkdt.graph_dev.runflags = s_graph_run_record_cmd_buf;
     if(vkdt.state.anim_playing) // should redraw because animation is playing?
-      vkdt.wstate.busy = vkdt.state.anim_max_frame == -1 ? 3 : vkdt.state.anim_max_frame - vkdt.state.anim_frame + 1;
+      vkdt.wstate.busy = vkdt.graph_dev.frame_cnt == 0 ? 3 : vkdt.graph_dev.frame_cnt - vkdt.state.anim_frame;
     if(vkdt.wstate.busy > 0) glfwPostEmptyEvent();
     else vkdt.wstate.busy = 3;
 
+    double end_rf = dt_time();
     if(frame_limiter)
     { // artificially limit frames rate to frame_limiter milliseconds/frame as minimum.
-      double end_rf = dt_time();
       if(frame_limiter && end_rf - beg_rf < frame_limiter / 1000.0)
       {
         usleep(frame_limiter * 1000);
         continue;
       }
       // dt_log(s_log_perf, "fps %.2g", 1.0/(end_rf - beg_rf));
-      beg_rf = end_rf;
     }
+    vkdt.wstate.delta_time = end_rf - beg_rf;
+    beg_rf = end_rf;
 
     // collect input from windows for our contexts.
     // enable mouse grab only on wayland (is buggy on x11 and windows for wacom, see https://github.com/hanatos/vkdt/issues/144)
@@ -334,8 +337,7 @@ int main(int argc, char *argv[])
     if(vkdt.graph_dev.gui_msg && vkdt.graph_dev.gui_msg[0]) dt_gui_notification(vkdt.graph_dev.gui_msg);
     // double t1 = dt_time();
 
-    if(dt_gui_render() == VK_SUCCESS)
-      dt_gui_present();
+    dt_gui_render();
     // double t2 = dt_time();
     // dt_log(s_log_perf, "frame cpu: process\t%8.3f ms  render\t%8.3f ms", 1000.0*(t1-t0), 1000.0*(t2-t1));
 
@@ -356,6 +358,7 @@ int main(int argc, char *argv[])
   dt_rc_set_int(&vkdt.rc, "gui/wd", vkdt.win.width/vkdt.win.content_scale[0]);
   dt_rc_set_int(&vkdt.rc, "gui/ht", vkdt.win.height/vkdt.win.content_scale[1]);
 
+  dt_snd_cleanup(&vkdt.snd);
   threads_shutdown();
   threads_global_cleanup(); // join worker threads before killing their resources
   dt_thumbnails_cleanup(&vkdt.thumbnails);

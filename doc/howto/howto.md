@@ -12,6 +12,7 @@ this folder lists quick instructions on a few special topics:
 
 * [display colour management](./colour-display/readme.md)
 * [how to characterise the colour response of your camera](./colour-input/readme.md)
+* [use spektrafilm from camera rgb directly](./colour-spec/readme.md)
 
 ## processing topics
 
@@ -27,6 +28,10 @@ this folder lists quick instructions on a few special topics:
 * [how to find similar modules to darktable](./dt/readme.md)
 * [how to customise the default processing graph](./defgraph/readme.md)
 * [how to customise the favourites ui in darkroom mode](./favs/readme.md)
+
+## for developers
+
+* [how to add support for additional file formats](./file-support/readme.md)
 
 
 -- these following topics do not exist yet --

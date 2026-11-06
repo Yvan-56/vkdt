@@ -30,7 +30,7 @@
 
             cargoDeps = pkgs.rustPlatform.fetchCargoVendor {
               inherit pname src cargoRoot;
-              hash = "sha256-ozPrxEVMihw1usPlI/+vp+fJIjI8P+hN8gcD+Tsdwgw=";
+              hash = "sha256-xHORlp8fGLB0s4ZBjOvtu69S4RyMxOyzAqEeSt2CZHI=";
             };
 
             strictDeps = true;
@@ -50,13 +50,14 @@
 
             buildInputs = with pkgs; [
               exiftool
-              alsa-lib
               ffmpeg
               glfw
               libjpeg
+              libjxl
               libmad
               libvorbis
               llvmPackages.openmp
+              pipewire
               vulkan-headers
               vulkan-loader
               vulkan-tools
@@ -71,6 +72,10 @@
               "VKDT_USE_RAWINPUT=2" # typically sets this by checking for `rustc --version`, lets save a dependency :)
               "VKDT_USE_MCRAW=false" # TODO: support mcraw
             ];
+
+            meta = {
+              mainProgram = "vkdt";
+            };
           };
 
           default = vkdt-git;

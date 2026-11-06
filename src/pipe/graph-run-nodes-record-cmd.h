@@ -3,6 +3,8 @@
 static inline VkResult
 record_command_buffer(dt_graph_t *graph, dt_node_t *node, int runflag)
 {
+  // video decoding dispatches its own command buffer up front:
+  if(node->type == s_node_vid_dec) return VK_SUCCESS;
   VkCommandBuffer cmd_buf = dt_graph_cmd_buf(graph);
 
   // sanity check: are all input connectors bound?
@@ -107,16 +109,12 @@ record_command_buffer(dt_graph_t *graph, dt_node_t *node, int runflag)
         for(int k=0;k<MAX(1,node->connector[i].array_length);k++)
         {
           VkBuffer buf = dt_graph_connector_image(graph, node-graph->node, i, k,
-              (node->connector[i].flags & s_conn_feedback) ?
-              1-(graph->double_buffer & 1) :
               graph->double_buffer)->buffer;
           vkCmdFillBuffer(cmd_buf, buf, 0, VK_WHOLE_SIZE, 0);
           BARRIER_COMPUTE_BUFFER(buf);
           if((node->connector[i].flags & s_conn_clear_once) && graph->frame == 0)
-          { // at startup, also clear double buffer
+          { // at startup, also clear the other double buffer
             VkBuffer buf = dt_graph_connector_image(graph, node-graph->node, i, k,
-                (node->connector[i].flags & s_conn_feedback) ?
-                graph->double_buffer :
                 1-(graph->double_buffer & 1))->buffer;
             vkCmdFillBuffer(cmd_buf, buf, 0, VK_WHOLE_SIZE, 0);
             BARRIER_COMPUTE_BUFFER(buf);
@@ -428,12 +426,7 @@ dt_graph_run_nodes_record_cmd(
 {
   if(run & s_graph_run_record_cmd_buf)
   {
-    VkCommandBufferBeginInfo begin_info = {
-      .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
-      .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
-    };
     int buf_curr = graph->double_buffer;
-    QVKR(vkBeginCommandBuffer(dt_graph_cmd_buf(graph), &begin_info));
     graph->query[buf_curr].cnt = 0;
     vkCmdResetQueryPool(dt_graph_cmd_buf(graph), graph->query[buf_curr].pool, 0, graph->query[buf_curr].max);
     int bvh_cnt = 0;
@@ -460,15 +453,10 @@ dt_graph_run_nodes_record_cmd(
         dt_log(s_log_perf, "create raytrace accel:\t%8.3f ms", 1000.0*(rt_end-rt_beg));
         bvh_cnt = -1; // don't do this again
       }
-      if(res != VK_SUCCESS)
-      { // need to clean up command buffer before we quit
-        QVKR(vkEndCommandBuffer(dt_graph_cmd_buf(graph)));
-        return res;
-      }
+      if(res != VK_SUCCESS) return res;
     }
     double rt_end = dt_time();
     dt_log(s_log_perf, "record command buffer:\t%8.3f ms", 1000.0*(rt_end-rt_beg));
-    QVKR(vkEndCommandBuffer(dt_graph_cmd_buf(graph)));
   }
   return VK_SUCCESS;
 }

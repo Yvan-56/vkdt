@@ -42,6 +42,14 @@ export VKDT_USE_RAWINPUT
 # VKDT_EXIV2_LDFLAGS=-L/ucrt64/bin -lexiv2-28 -lcurl-4 -lexpat-1 -lz
 # export VKDT_EXIV2_CFLAGS VKDT_EXIV2_LDFLAGS
 
+# optionally build jpeg-xl output with libjxl, offers improved
+# compression over jpeg, and wide-colour/hdr support.
+VKDT_USE_JXL=1
+export VKDT_USE_JXL
+VKDT_JXL_CFLAGS=-I/c/msys64/ucrt64/include
+VKDT_JXL_LDFLAGS=-L/ucrt64/lib -ljxl -ljxl_threads
+export VKDT_JXL_CFLAGS VKDT_JXL_LDFLAGS
+
 # v4l2 is used to read real-time webcam input in the i-v4l2 module.
 # enable this feature here:
 # VKDT_USE_V4L2=1
@@ -108,10 +116,10 @@ GLSLC=/ucrt64/bin/glslangValidator.exe
 GLSLC_FLAGS=--target-env vulkan1.3
 # GLSLC=glslc
 # GLSLC_FLAGS=--target-env=vulkan1.3
-CFLAGS=-I/c/msys64/ucrt64/include -I. -D_POSIX_C_SOURCE
-CXXFLAGS=-Wall -pipe -I. -D_GNU_SOURCE -I/c/msys64/ucrt64/include
+BASE_CFLAGS=-I/c/msys64/ucrt64/include -I. -D_POSIX_C_SOURCE
+BASE_CXXFLAGS=-Wall -pipe -I. -D_GNU_SOURCE -I/c/msys64/ucrt64/include
 LDFLAGS=-L/c/msys64/ucrt64/lib -lregex
-export CFLAGS CXXFLAGS LDFLAGS
+export BASE_CFLAGS BASE_CXXFLAGS LDFLAGS
 
 # optimised flags, you may want to use -march=x86-64 for distro builds:
 OPT_CFLAGS=-Wall -pipe -O3 -march=native -DNDEBUG

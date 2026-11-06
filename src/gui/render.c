@@ -97,7 +97,7 @@ void dt_gui_init_fonts()
     const char *fontfile = dt_rc_get(&vkdt.rc, "gui/msdffont", "font");
     threads_mutex_lock(&qvk.queue[qvk.qid[s_queue_graphics]].mutex);
     int ret = nk_glfw3_font_load(fontfile, fontsize,
-        vkdt.win.command_buffer[vkdt.win.frame_index%DT_GUI_MAX_IMAGES],
+        vkdt.win.command_buffer[vkdt.win.frame_index],
         qvk.queue[qvk.qid[s_queue_graphics]].queue);
     threads_mutex_unlock(&qvk.queue[qvk.qid[s_queue_graphics]].mutex);
     nk_style_set_font(&vkdt.ctx, nk_glfw3_font(0));
@@ -174,7 +174,7 @@ void dt_gui_update_cm()
   { // running on hdr monitor
     gamma0[0] = gamma0[1] = gamma0[2] = -1.0; // PQ
     gamma1[0] = gamma1[1] = gamma1[2] = -1.0;
-    gamma0[1] = gamma1[1] = dt_rc_get_float(&vkdt.rc, "gui/hdr_avg_nits", 128.0f);
+    gamma0[1] = gamma1[1] = dt_rc_get_float(&vkdt.rc, "gui/hdr_avg_nits", 50.0f);
     memset(rec2020_to_dspy0, 0, sizeof(rec2020_to_dspy0));
     memset(rec2020_to_dspy1, 0, sizeof(rec2020_to_dspy1));
     rec2020_to_dspy0[0] = rec2020_to_dspy0[4] = rec2020_to_dspy0[8] = 
@@ -191,8 +191,8 @@ int dt_gui_init_nk()
       vkdt.win.render_pass,
       vkdt.win.window,
       qvk.device, qvk.physical_device,
-      vkdt.win.num_swap_chain_images * 2560*1024,
-      vkdt.win.num_swap_chain_images * 640*1024);
+      DT_GUI_MAX_FRAMES_IN_FLIGHT * 2560*1024,
+      DT_GUI_MAX_FRAMES_IN_FLIGHT * 640*1024);
 
   dt_gui_update_cm();
 
@@ -277,6 +277,8 @@ void dt_gui_render_frame_nk()
     nk_end(&vkdt.ctx);
   }
   threads_mutex_unlock(&vkdt.wstate.notification_mutex);
+
+  dt_screencast_render();
 
   // nuklear requires the input, when modifying a text edit etc:
   vkdt.wstate.nk_active = vkdt.wstate.nk_active_next;
@@ -393,7 +395,11 @@ void dt_gamepadhelp()
   };
   struct nk_command_buffer *buf = nk_window_get_canvas(&vkdt.ctx);
   struct nk_color col = {0xff,0xff,0xff,0xff};
-  dt_draw(&vkdt.ctx, dt_draw_list_gamepad, NK_LEN(dt_draw_list_gamepad), col, m);
+  const float thickness = vkdt.state.center_wd * 0.002f;
+  static struct nk_user_font font; // keep  memory around
+  font = *nk_glfw3_font(0);
+  font.height = vkdt.state.center_wd * 0.02;
+  dt_draw(&vkdt.ctx, dt_draw_list_gamepad, NK_LEN(dt_draw_list_gamepad), col, thickness, m);
   for(int k=0;k<dt_gamepadhelp_cnt;k++)
   {
     if(g_gamepadhelp.help[g_gamepadhelp.sp][k])
@@ -402,14 +408,14 @@ void dt_gamepadhelp()
       if(k > 4 && map_button[k] >= 0 &&
          gamepad.buttons[map_button[k]])
         c = vkdt.style.colour[NK_COLOR_DT_ACCENT];
-      if((k == 0 && fabsf(gamepad.axes[GLFW_GAMEPAD_AXIS_LEFT_X]) > 0.02) ||
-         (k == 0 && fabsf(gamepad.axes[GLFW_GAMEPAD_AXIS_LEFT_Y]) > 0.02) ||
-         (k == 1 && fabsf(gamepad.axes[GLFW_GAMEPAD_AXIS_RIGHT_X]) > 0.02) ||
-         (k == 1 && fabsf(gamepad.axes[GLFW_GAMEPAD_AXIS_RIGHT_Y]) > 0.02) ||
-         (k == 2 && gamepad.axes[GLFW_GAMEPAD_AXIS_LEFT_TRIGGER]  > -0.98) ||
-         (k == 3 && gamepad.axes[GLFW_GAMEPAD_AXIS_RIGHT_TRIGGER] > -0.98))
+      if((k == 0 && fabsf(gamepad.axes[GLFW_GAMEPAD_AXIS_LEFT_X]) > 0.05) ||
+         (k == 0 && fabsf(gamepad.axes[GLFW_GAMEPAD_AXIS_LEFT_Y]) > 0.05) ||
+         (k == 1 && fabsf(gamepad.axes[GLFW_GAMEPAD_AXIS_RIGHT_X]) > 0.05) ||
+         (k == 1 && fabsf(gamepad.axes[GLFW_GAMEPAD_AXIS_RIGHT_Y]) > 0.05) ||
+         (k == 2 && gamepad.axes[GLFW_GAMEPAD_AXIS_LEFT_TRIGGER]  > -0.95) ||
+         (k == 3 && gamepad.axes[GLFW_GAMEPAD_AXIS_RIGHT_TRIGGER] > -0.95))
         c = vkdt.style.colour[NK_COLOR_DT_ACCENT];
-      dt_draw(&vkdt.ctx, dt_draw_list_gamepad_arrow[k], NK_LEN(dt_draw_list_gamepad_arrow[k]), c, m);
+      dt_draw(&vkdt.ctx, dt_draw_list_gamepad_arrow[k], NK_LEN(dt_draw_list_gamepad_arrow[k]), c, thickness, m);
       struct nk_vec2 v = {dt_draw_list_gamepad_arrow[k][8], dt_draw_list_gamepad_arrow[k][9]};
       struct nk_rect rect = {
         .x = v.x * m[3*0 + 0] + v.y * m[3*0 + 1] + m[3*0 + 2],
@@ -417,8 +423,52 @@ void dt_gamepadhelp()
       };
       rect.w = rect.x + 300;
       rect.h = rect.y + 300;
-      rect.y -= 0.03*vkdt.state.center_ht;
-      nk_draw_text(buf, rect, g_gamepadhelp.help[g_gamepadhelp.sp][k], strlen(g_gamepadhelp.help[g_gamepadhelp.sp][k]), nk_glfw3_font(1), nk_rgb(0,0,0), c);
+      rect.y -= font.height;
+      nk_draw_text(buf, rect, g_gamepadhelp.help[g_gamepadhelp.sp][k], strlen(g_gamepadhelp.help[g_gamepadhelp.sp][k]), &font, nk_rgb(0,0,0), c);
+
+      if(k <= 3)
+      { // axis?
+        struct nk_vec2 u = {dt_draw_list_gamepad_arrow[k][0], dt_draw_list_gamepad_arrow[k][1]};
+        float r = 0.015*vkdt.state.center_wd;
+        rect = (struct nk_rect) {
+          .x = u.x * m[3*0 + 0] + u.y * m[3*0 + 1] + m[3*0 + 2] - r,
+          .y = u.x * m[3*1 + 0] + u.y * m[3*1 + 1] + m[3*1 + 2] - r,
+          .w = 2*r,
+          .h = 2*r,
+        };
+        if(k==0)
+        {
+          rect.x += r*gamepad.axes[GLFW_GAMEPAD_AXIS_LEFT_X] + 1.25*r;
+          rect.y += r*gamepad.axes[GLFW_GAMEPAD_AXIS_LEFT_Y] - 0.77*r;
+          nk_stroke_circle(buf, rect, thickness, c);
+        }
+        else if(k==1)
+        {
+          rect.x += r*gamepad.axes[GLFW_GAMEPAD_AXIS_RIGHT_X] - 0.95*r;
+          rect.y += r*gamepad.axes[GLFW_GAMEPAD_AXIS_RIGHT_Y] - 1.05*r;
+          nk_stroke_circle(buf, rect, thickness, c);
+        }
+        else
+        {
+          float ax = 0.0f;
+          if(k == 2) ax = r*gamepad.axes[GLFW_GAMEPAD_AXIS_LEFT_TRIGGER];
+          if(k == 3) ax = r*gamepad.axes[GLFW_GAMEPAD_AXIS_RIGHT_TRIGGER];
+          rect.y -= ax; rect.h += ax;
+          if(k == 2)
+          {
+            rect.x += 0.06*r;
+            rect.y -= 0.02*r;
+            rect.w = 3.02*r;
+          }
+          if(k == 3)
+          {
+            rect.x -= 1.4*r;
+            rect.y -= 0.15*r;
+            rect.w = 3.02*r;
+          }
+          nk_stroke_rect(buf, rect, 0.4*r, thickness, c);
+        }
+      }
     }
   }
 }
